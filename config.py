@@ -41,9 +41,13 @@ class StrategyConfig:
     quantity_precision: int = 3           # GRVT: 0.001 step; HyENA: 0.00001 step
 
     # Order execution
-    aggressive_limit_offset_bps: float = 2.0  # mid +/- 2bps
+    aggressive_limit_offset_bps: float = 5.0  # mid +/- 5bps (hyna:BTC book can be thin)
     max_fill_wait_seconds: float = 5.0
     qty_mismatch_threshold: float = 0.001  # BTC
+
+    # External reward estimates (annualized %)
+    usde_reward_apr: float = 12.0   # USDe staking reward
+    grvt_reward_apr: float = 10.0   # GRVT equity reward
 
     # Rebalancing triggers (PRD Section 8.2)
     max_leverage: float = 3.0

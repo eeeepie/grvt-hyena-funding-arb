@@ -167,10 +167,17 @@ async def cmd_exit(strategy, alerter):
         alerter.info("无持仓")
         return
 
-    # Snapshot balances before close (for NAV comparison)
+    # Snapshot balances + book mid before close (for NAV & slippage comparison)
     h_bal, g_bal = strategy.hyena.get_balance(), strategy.grvt.get_balance()
+    h_book, g_book = strategy.hyena.get_book(), strategy.grvt.get_book()
+    h_mid_pre = h_book["mid"]
+    g_mid_pre = g_book["mid"]
 
     strategy.state.load_from_exchange(h_pos, g_pos)
+
+    # Try loading persisted entry state (cross-process)
+    if strategy.state.entry_time == 0:
+        strategy.state.load_entry_state()
 
     # Save snapshot before close resets state
     has_entry_data = strategy.state.entry_time > 0
@@ -200,6 +207,7 @@ async def cmd_exit(strategy, alerter):
         await strategy.print_exit_pnl(
             pre_h_pos=h_pos, pre_g_pos=g_pos,
             pre_h_bal=h_bal, pre_g_bal=g_bal,
+            pre_h_mid=h_mid_pre, pre_g_mid=g_mid_pre,
         )
     else:
         alerter.critical("平仓可能不完整!")

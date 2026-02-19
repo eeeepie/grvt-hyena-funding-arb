@@ -28,7 +28,8 @@ python3 main.py entry               # open positions (interactive)
 | `python3 main.py rates` | Current funding rates, spread, yield estimate |
 | `python3 main.py entry` | Interactive entry: set USD amount & max leverage → open + monitor |
 | `python3 main.py monitor` | Re-attach monitoring to existing positions (Ctrl+C to stop) |
-| `python3 main.py exit` | Close both legs simultaneously |
+| `python3 main.py exit` | Close both legs simultaneously + PnL attribution report |
+| `python3 mtm.py` | Mark-to-market PnL snapshot (不平仓) |
 
 ### Entry Flow
 
@@ -99,6 +100,7 @@ kill $(cat logs/monitor.pid)
 ```bash
 python3 main.py status               # positions + rates
 python3 main.py rates                 # quick rate check
+python3 mtm.py                        # mark-to-market PnL report
 tail -30 logs/alerts.log              # recent alerts
 ```
 
@@ -112,7 +114,9 @@ config.py            ← Settings & thresholds (reads .env)
 exchange_clients.py  ← HyENA + GRVT API wrappers + trading
 strategy_engine.py   ← Entry/exit/mirror close/rebalance
 monitor.py           ← Funding logging, alerts, circuit breaker
+mtm.py               ← Mark-to-market PnL report (standalone)
 btc_funding_compare_v3.py ← Standalone rate comparison (read-only, no keys)
+data/entry_state.json ← Entry snapshot (auto-managed)
 ```
 
 ---

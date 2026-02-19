@@ -616,10 +616,24 @@ class GrvtClient:
         logger.info(f"GRVT result: {result}")
         return result
 
-    def market_close(self, size: float, is_long: bool) -> dict:
-        """Close position with aggressive IOC. 0.5% offset for fill certainty."""
-        mid = self.get_mid_price()
-        if is_long:
-            return self.place_order(False, abs(size), round(mid * 0.995, 1), reduce_only=True)
-        else:
-            return self.place_order(True, abs(size), round(mid * 1.005, 1), reduce_only=True)
+    def market_close(self, size: float, is_long: bool, max_retries: int = 3) -> dict:
+        """Close position with aggressive IOC. Retries with fresh signature on failure."""
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                mid = self.get_mid_price()
+                # 1% offset on retry (0.5% first attempt) for more aggressive fill
+                offset = 0.005 if attempt == 0 else 0.01
+                if is_long:
+                    px = round(mid * (1 - offset), 1)
+                    result = self.place_order(False, abs(size), px, reduce_only=True)
+                else:
+                    px = round(mid * (1 + offset), 1)
+                    result = self.place_order(True, abs(size), px, reduce_only=True)
+                return result
+            except Exception as e:
+                last_err = e
+                logger.warning(f"GRVT market_close attempt {attempt + 1}/{max_retries} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+        raise RuntimeError(f"GRVT market_close failed after {max_retries} attempts: {last_err}")

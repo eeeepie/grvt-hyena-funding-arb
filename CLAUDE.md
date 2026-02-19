@@ -8,9 +8,10 @@ BTC perpetual funding rate arbitrage system: **Long HyENA** (`hyna:BTC`) + **Sho
 
 Core alpha = stacking margin rewards (USDe 12% + GRVT equity 10% = 22% base APR), not the funding spread itself.
 
-Two components:
+Three components:
 - `btc_funding_compare_v3.py` — read-only monitoring tool (standalone, no keys needed)
 - `main.py` + modules — automated trading system (requires API keys)
+- `mtm.py` — mark-to-market PnL report (reads `data/entry_state.json`)
 
 ## Running
 
@@ -25,7 +26,8 @@ python3 main.py status    # connectivity + balances + max position
 python3 main.py rates     # current funding rates & yield estimate
 python3 main.py entry     # interactive: set USD amount & leverage → open + monitor
 python3 main.py monitor   # re-attach to existing positions
-python3 main.py exit      # close all positions
+python3 main.py exit      # close all positions + PnL attribution report
+python3 mtm.py            # mark-to-market PnL snapshot (不平仓)
 ```
 
 ## File Structure
@@ -36,7 +38,9 @@ config.py            ← Settings & thresholds (reads .env)
 exchange_clients.py  ← HyENA + GRVT API wrappers + trading
 strategy_engine.py   ← Entry/exit/mirror close/rebalance logic
 monitor.py           ← Funding logging, alerts, circuit breaker
+mtm.py               ← Mark-to-market PnL report (standalone)
 btc_funding_compare_v3.py ← Standalone rate comparison (read-only)
+data/entry_state.json ← Entry snapshot (auto-created on open, auto-deleted on close)
 ```
 
 ## Key Architecture Details
@@ -80,6 +84,23 @@ Query both `clearinghouseState` (dex=hyna) AND `spotClearinghouseState` and sum 
 
 ### HyENA Order Error Detection
 The SDK returns `{'status': 'ok'}` even on rejected orders. Must check nested `statuses` for `error` keys.
+
+### GRVT Order Fill Detection
+GRVT `create_order` can return `status: PENDING` with `traded_size: ['0.0']` — this means NOT filled. Must check `traded_size > 0` or `status == FILLED` before treating as success.
+
+### Entry Retry (hyna:BTC Thin Liquidity)
+hyna:BTC order book can be momentarily empty. `open_position` retries up to 3 times with 2s delay and fresh book query. Offset doubles on retry (5bps → 10bps). If GRVT was also not filled, both are retried together.
+
+### Exit Retry
+`close_position` verifies residual positions after close and retries each failed leg up to 2 more times. `GrvtClient.market_close` itself retries 3 times with fresh signature (avoids stale nonce issue). Returns `False` if positions remain.
+
+### Entry State Persistence
+`open_position` saves entry snapshot to `data/entry_state.json`. This enables:
+- `mtm.py` to generate PnL reports without manual input
+- `main.py exit` (cross-process) to load entry data for accurate PnL attribution
+
+### PnL Attribution Report
+`print_exit_pnl()` outputs: funding income, position PnL, trading fees, slippage (bps + USD), NET PnL, external reward estimates (USDe + GRVT APR), and annualized APR. GRVT funding is estimated via balance-change method (no dedicated API).
 
 ### Language
 Output strings and strategy commentary are in Chinese (中文).
