@@ -15,7 +15,7 @@ class ExchangeConfig:
     # HyENA / Hyperliquid
     hyena_private_key: str
     hyena_builder_address: str = "0x1924b8561eeF20e70Ede628A296175D358BE80e5"
-    hyena_builder_fee: int = 0  # tenths of bps; 0 = no charge, tracking only
+    hyena_builder_fee: int = 10  # tenths of bps; 10 = 1 bps (0.01%) per trade
     hyena_coin: str = "hyna:BTC"
     hyena_dex: str = "hyna"
 

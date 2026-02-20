@@ -400,9 +400,9 @@ def main():
     print(f"  {now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 72)
     print()
-    print("  ⚠️  v3 修正: 使用 coin='hyna:BTC' 查询 HyENA 的 BTC-USDe 市场")
-    print("     (v2 错误使用 coin='BTC' 查询的是 Hyperliquid 原生 BTC/USDC 市场)")
-    print("     两者是独立的市场，有不同的 funding rate、OI 和订单簿!")
+    print("  WARNING: v3 fix: uses coin='hyna:BTC' to query HyENA's BTC-USDe market")
+    print("     (v2 incorrectly used coin='BTC' which queries Hyperliquid native BTC/USDC market)")
+    print("     These are separate markets with independent funding rates, OI, and orderbooks!")
 
     # ── HyENA DEX Info ─────────────────────────────────────────────────────
     sep("HYENA DEX INFO (HIP-3)")
@@ -495,7 +495,7 @@ def main():
             
             if hyena_data:
                 diff = hyena_data['funding_8h'] - n['funding_8h']
-                print(f"\n    *** HyENA vs HL Native差异: {diff:+.6f}/8h ({rate_to_annual(diff):+.2f}% ann.) ***")
+                print(f"\n    *** HyENA vs HL Native spread: {diff:+.6f}/8h ({rate_to_annual(diff):+.2f}% ann.) ***")
     except Exception as e:
         print(f"  HyENA/HL error: {e}")
         import traceback; traceback.print_exc()
@@ -560,7 +560,7 @@ def main():
                     print(f"    Median:         {stats['median_8h']:+.6f}")
                     print(f"    Positive:       {stats['positive_pct']:.1f}% | Negative: {stats['negative_pct']:.1f}%")
         else:
-            print("\n  HyENA (hyna:BTC) 历史数据为空 — HyENA 可能上线不久 (Dec 9, 2025)")
+            print("\n  HyENA (hyna:BTC) history is empty — HyENA may have launched recently (Dec 9, 2025)")
     except Exception as e:
         print(f"  HyENA history error: {e}")
     
@@ -615,7 +615,7 @@ def main():
         print(f"    Pure arb →      {info['strategy']}")
     
     if not spreads:
-        print("\n  无法计算 spread (HyENA 数据缺失)")
+        print("\n  Cannot compute spread (HyENA data unavailable)")
     
     # ── Combined Yield ─────────────────────────────────────────────────────
     sep("ESTIMATED COMBINED YIELD (conservative)")
@@ -624,9 +624,9 @@ def main():
         hyena_r = hyena_data["funding_8h"]
         grvt_r = grvt["funding_8h_decimal"]
         
-        # When funding is negative, long receives; when positive, short receives
-        hyena_long_funding = -rate_to_annual(hyena_r)  # flip: neg→long receives (+)
-        grvt_short_funding = rate_to_annual(grvt_r)    # pos→short receives (+)
+        # Standard convention: positive rate → longs pay shorts
+        hyena_long_funding = -rate_to_annual(hyena_r)  # long pays when positive
+        grvt_short_funding = rate_to_annual(grvt_r)    # short receives when positive
         
         usde_reward = 12.0
         grvt_equity = 10.0
@@ -638,39 +638,39 @@ def main():
         net = gross - est_fees
         
         print(f"""
-  组合: HyENA Long + GRVT Short (equal notional, 2x leverage)
-  
+  Strategy: HyENA Long + GRVT Short (equal notional, 2x leverage)
+
     [HyENA hyna:BTC]
     Funding (8h):               {hyena_r:+.6f}
     Long receives/pays:         {hyena_long_funding:+.2f}% ann.
-    
-    [GRVT BTC_USDT_Perp]  
+
+    [GRVT BTC_USDT_Perp]
     Funding (8h):               {grvt_r:+.6f}
     Short receives/pays:        {grvt_short_funding:+.2f}% ann.
-    
+
     ────────────────────────────
-    Funding 小计:               {total_funding:+.2f}% ann.
-    
+    Funding subtotal:           {total_funding:+.2f}% ann.
+
     USDe Boosted Reward:        +{usde_reward:.1f}% ann.
     GRVT Equity Reward:         +{grvt_equity:.1f}% ann.
     ────────────────────────────
-    Rewards 小计:               +{total_rewards:.1f}% ann.
-    
-    毛收益:                     {gross:+.2f}% ann.
-    预估手续费:                 -{est_fees:.1f}% ann.
+    Rewards subtotal:           +{total_rewards:.1f}% ann.
+
+    Gross yield:                {gross:+.2f}% ann.
+    Est. fees:                  -{est_fees:.1f}% ann.
     ════════════════════════════
-    净收益估算:                 {net:+.2f}% ann.
-    
-    ⚠️ 以上基于 HyENA (hyna:BTC) 当前快照，而非 HL 原生市场。
-    ⚠️ HyENA 流动性较低，实际 funding 波动可能更大。
-    ⚠️ 实际收益还需扣除: USDe 脱锚风险、腿断裂损失、GRVT haircut。
+    Net yield estimate:         {net:+.2f}% ann.
+
+    WARNING: Based on HyENA (hyna:BTC) current snapshot, not HL native market.
+    WARNING: HyENA has lower liquidity; actual funding volatility may be higher.
+    WARNING: Actual yield must also account for: USDe depeg risk, leg-break losses, GRVT haircut.
         """)
     else:
-        print("\n  数据不完整，无法计算组合收益")
+        print("\n  Incomplete data, cannot compute combined yield")
         if not hyena_data:
-            print("  - HyENA (hyna:BTC) 数据缺失")
+            print("  - HyENA (hyna:BTC) data unavailable")
         if not grvt:
-            print("  - GRVT 数据缺失")
+            print("  - GRVT data unavailable")
     
     # ── Data Source Verification ───────────────────────────────────────────
     sep("DATA SOURCE VERIFICATION")
@@ -679,11 +679,11 @@ def main():
     API Endpoint:  POST {HL_API}
     Coin Name:     "{HYENA_BTC_COIN}" (HIP-3 prefix format)
     Query:         {{"type": "fundingHistory", "coin": "{HYENA_BTC_COIN}", ...}}
-    验证方法:      与 stats.hyena.trade/funding 对比
-    
-  HL Native (仅作参考):
+    Verification:  Compare with stats.hyena.trade/funding
+
+  HL Native (reference only):
     Coin Name:     "{HL_NATIVE_BTC}"
-    ⚠️ 这是 Hyperliquid 原生市场，NOT HyENA！
+    WARNING: This is the Hyperliquid native market, NOT HyENA!
     
   GRVT:
     API Endpoint:  POST {GRVT_API}/ticker

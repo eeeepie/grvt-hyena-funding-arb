@@ -25,7 +25,7 @@ async def main():
     g_sz = g_pos.get("size", 0)
 
     if abs(h_sz) < 0.001 and abs(g_sz) < 0.001:
-        print("无持仓，无法生成报告")
+        print("No positions found, cannot generate report")
         return
 
     # Current books + balances
@@ -54,13 +54,13 @@ async def main():
         # Use position entry_px as mid approximation
         strategy.state.entry_h_mid = h_entry_px
         strategy.state.entry_g_mid = g_entry_px
-        print("  (未找到 entry_state.json，部分数据为近似值)\n")
+        print("  (entry_state.json not found, some values are approximate)\n")
 
     # Infer entry time: state file > 0, else unknown
     if strategy.state.entry_time > 0:
         entry_time = strategy.state.entry_time
     else:
-        print("  无法确定开仓时间，无法生成报告")
+        print("  Cannot determine entry time, cannot generate report")
         return
 
     hold_secs = time.time() - entry_time
@@ -77,21 +77,22 @@ async def main():
         try:
             h_funding = hyena.get_accumulated_funding(entry_ms, h_size)
         except Exception as e:
-            print(f"  (HyENA funding查询失败: {e})")
+            print(f"  (HyENA funding query failed: {e})")
 
-    # GRVT: derive funding from balance change
-    # total_leg_pnl = balance_now - balance_entry (includes funding + unrealized)
+    # GRVT: use funding_payment_history API (precise)
+    g_funding = 0.0
+    try:
+        start_ns = int(entry_time * 1e9)
+        g_funding = grvt.get_funding_payments(start_ns)
+    except Exception as e:
+        print(f"  (GRVT funding query failed: {e})")
+    funding_total = h_funding + g_funding
+
+    # Position PnL from price
     g_bal_now = g_bal.get("total_equity", 0) if isinstance(g_bal, dict) else 0
-    g_total_leg_pnl = g_bal_now - entry_g_bal
-    # Position PnL from price (short: entry - current)
     g_pos_pnl = (g_entry_px - g_mid) * g_size if g_entry_px else 0
     h_pos_pnl = (h_mid - h_entry_px) * h_size if h_entry_px else 0
     pos_total = h_pos_pnl + g_pos_pnl
-    # GRVT funding ≈ total leg change - position unrealized PnL
-    # Use exchange unrealized_pnl if available (more accurate than our price calc)
-    g_pos_pnl_exchange = g_unrealized if g_unrealized else g_pos_pnl
-    g_funding_est = g_total_leg_pnl - g_pos_pnl_exchange
-    funding_total = h_funding + g_funding_est
 
     # ── Fees from entry fills ──
     h_fills = []
@@ -106,7 +107,17 @@ async def main():
         pass
 
     h_entry_fills = [f for f in h_fills if f.get("dir") == "Open Long" or f.get("side") == "B"]
-    g_entry_fills = [f for f in g_fills if not f.get("is_buyer")]
+    # Filter GRVT fills: sell side + after entry time
+    def _grvt_time_secs(t):
+        """Normalize GRVT timestamp (could be ns/ms/s) to seconds."""
+        t = int(str(t))
+        if t > 1e15: return t / 1e9   # nanoseconds
+        if t > 1e12: return t / 1e3   # milliseconds
+        return t                       # seconds
+
+    g_entry_fills = [f for f in g_fills
+                     if not f.get("is_buyer")
+                     and _grvt_time_secs(f.get("time", 0)) >= entry_time - 60]
     h_entry_fee = sum(f["fee"] for f in h_entry_fills)
     g_entry_fee = sum(f["fee"] for f in g_entry_fills)
     fee_total = h_entry_fee + g_entry_fee
@@ -117,13 +128,19 @@ async def main():
     # ── Per-leg totals (matches frontend) ──
     h_bal_now = h_bal.get("account_value", 0) if isinstance(h_bal, dict) else 0
     h_leg_total = h_bal_now - entry_h_bal
-    g_leg_total = g_total_leg_pnl
+    g_leg_total = g_bal_now - entry_g_bal
 
     # ── Rewards ──
     h_notional = h_size * h_entry_px
     g_notional = g_size * g_entry_px
-    usde_reward = h_notional * (strategy_cfg.usde_reward_apr / 100) * (holding_days / 365)
-    grvt_reward = g_notional * (strategy_cfg.grvt_reward_apr / 100) * (holding_days / 365)
+    # HyENA: eligible = min(actual USDe balance, notional)
+    h_usde = h_bal.get("spot_usde", h_bal.get("account_value", 0)) if isinstance(h_bal, dict) else 0
+    h_eligible = min(h_usde, h_notional)
+    # GRVT: eligible = initial_margin (account equity, leverage-agnostic)
+    g_margin = (g_bal_now - g_bal.get("available_balance", 0)) if isinstance(g_bal, dict) else g_bal_now
+    g_eligible = g_bal.get("initial_margin", g_margin) if isinstance(g_bal, dict) else g_margin
+    usde_reward = h_eligible * (strategy_cfg.usde_reward_apr / 100) * (holding_days / 365)
+    grvt_reward = g_eligible * (strategy_cfg.grvt_reward_apr / 100) * (holding_days / 365)
     reward_total = usde_reward + grvt_reward
 
     # ── NAV ──
@@ -134,9 +151,11 @@ async def main():
     trade_apr = (net_pnl / nav_before) * (365 / holding_days) * 100 if nav_before > 0 and holding_days > 0 else 0
     total_apr = ((net_pnl + reward_total) / nav_before) * (365 / holding_days) * 100 if nav_before > 0 and holding_days > 0 else 0
 
-    # ── Leverage ──
-    h_lev = h_notional / h_bal_now if h_bal_now > 0 else 0
-    g_lev = g_notional / g_bal_now if g_bal_now > 0 else 0
+    # ── Leverage (margin used, not total equity) ──
+    h_perps = h_bal.get("perps_margin", h_bal_now) if isinstance(h_bal, dict) else h_bal_now
+    h_lev = h_notional / h_perps if h_perps > 0 else 0
+    g_margin = (g_bal_now - g_bal.get("available_balance", 0)) if isinstance(g_bal, dict) else g_bal_now
+    g_lev = g_notional / g_margin if g_margin > 0 else 0
 
     # ── Attribution % ──
     abs_sum = abs(funding_total) + abs(pos_total) + fee_total
@@ -154,46 +173,46 @@ async def main():
 
     lines = []
     lines.append(f"\n{'═' * W}")
-    lines.append(f"  持仓损益报告 (Mark-to-Market)")
+    lines.append(f"  P&L Report (Mark-to-Market)")
     lines.append(f"{'═' * W}")
-    lines.append(f"\n  持仓: {hold_str}")
-    lines.append(f"  仓位: Long hyna:BTC / Short BTC_USDT_Perp")
-    lines.append(f"  数量: {avg_size:.5f} BTC (≈ ${avg_size * h_entry_px:,.0f}/腿)")
-    lines.append(f"  杠杆: HyENA {h_lev:.1f}x / GRVT {g_lev:.1f}x")
+    lines.append(f"\n  Holding: {hold_str}")
+    lines.append(f"  Position: Long hyna:BTC / Short BTC_USDT_Perp")
+    lines.append(f"  Size: {avg_size:.5f} BTC (approx ${avg_size * h_entry_px:,.0f}/leg)")
+    lines.append(f"  Leverage: HyENA {h_lev:.1f}x / GRVT {g_lev:.1f}x")
 
     # Per-leg totals (matches frontend display)
-    lines.append(f"\n  ── 各腿总损益 (与前端一致) ──")
+    lines.append(f"\n  -- Per-Leg Total P&L (matches frontend) --")
     lines.append(f"    HyENA:  {h_leg_total:+.2f} USD  (unrealized: {h_unrealized:+.2f})")
     lines.append(f"    GRVT:   {g_leg_total:+.2f} USDT (unrealized: {g_unrealized:+.2f})")
 
-    lines.append(f"\n  ── PnL 归因 ──")
+    lines.append(f"\n  -- P&L Attribution --")
     lines.append(f"    Funding Income:          {funding_total:+10.2f}     ({_pct(funding_total):+5.1f}%)")
     lines.append(f"      HyENA (long):              {h_funding:+.2f}")
-    lines.append(f"      GRVT (估算):               {g_funding_est:+.2f}  (余额变动-持仓浮盈)")
+    lines.append(f"      GRVT (short):              {g_funding:+.2f}")
 
     lines.append(f"    Position PnL:            {pos_total:+10.2f}     ({_pct(pos_total):+5.1f}%)")
     lines.append(f"      HyENA: ${h_entry_px:,.0f} → ${h_mid:,.0f}    {h_pos_pnl:+.2f}")
     lines.append(f"      GRVT:  ${g_entry_px:,.1f} → ${g_mid:,.1f}    {g_pos_pnl:+.2f}")
 
     lines.append(f"    Trading Fees:            {-fee_total:+10.2f}     ({_pct(-fee_total):+5.1f}%)")
-    lines.append(f"      开仓: H ${h_entry_fee:.2f} + G ${g_entry_fee:.2f}")
-    lines.append(f"      (平仓费用待实际平仓后计入)")
+    lines.append(f"      Entry: H ${h_entry_fee:.2f} + G ${g_entry_fee:.2f}")
+    lines.append(f"      (Exit fees will be included after closing)")
 
     lines.append(f"    {'─' * 37}")
-    lines.append(f"    实际 NET PnL:           {net_pnl:+10.2f}")
+    lines.append(f"    Actual NET PnL:         {net_pnl:+10.2f}")
 
-    lines.append(f"\n  ── External Rewards (估算) ──")
+    lines.append(f"\n  -- External Rewards (estimated) --")
     lines.append(f"    USDe staking ({strategy_cfg.usde_reward_apr:.0f}% APR):  {usde_reward:+.2f}")
     lines.append(f"    GRVT equity ({strategy_cfg.grvt_reward_apr:.0f}% APR):   {grvt_reward:+.2f}")
-    lines.append(f"    Reward 合计:             {reward_total:+.2f}")
+    lines.append(f"    Reward Total:            {reward_total:+.2f}")
 
     if nav_before > 0:
         nav_change = nav_now - nav_before
         nav_pct = nav_change / nav_before * 100
-        lines.append(f"\n  ── 年化收益 ──")
+        lines.append(f"\n  -- Annualized Returns --")
         lines.append(f"    NAV: ${nav_before:,.2f} → ${nav_now:,.2f}  ({nav_pct:+.3f}%)")
-        lines.append(f"    APR (纯交易):     {trade_apr:+.1f}%")
-        lines.append(f"    APR (含rewards):  {total_apr:+.1f}%")
+        lines.append(f"    APR (trading only):  {trade_apr:+.1f}%")
+        lines.append(f"    APR (w/ rewards):    {total_apr:+.1f}%")
 
     lines.append(f"{'═' * W}\n")
     print("\n".join(lines), flush=True)

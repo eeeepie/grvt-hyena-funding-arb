@@ -8,6 +8,10 @@ BTC perpetual funding rate arbitrage system: **Long HyENA** (`hyna:BTC`) + **Sho
 
 Core alpha = stacking margin rewards (USDe 12% + GRVT equity 10% = 22% base APR), not the funding spread itself.
 
+### Reward Basis
+- **HyENA 12% APR**: basis = `min(USDe balance, long notional)` — leverage multiplies reward; require USDe balance ≥ notional or reward is capped at balance
+- **GRVT 10% APR**: basis = account equity (margin only), leverage-agnostic; tiered caps at 1K / 20K / 100K USDT
+
 Three components:
 - `btc_funding_compare_v3.py` — read-only monitoring tool (standalone, no keys needed)
 - `main.py` + modules — automated trading system (requires API keys)
@@ -77,7 +81,9 @@ All rates normalized to 8h basis:
 
 **GRVT book API**: Requires `"depth": 10`. Other values return 400.
 
-**GRVT leverage**: No API to set leverage — must be configured in GRVT frontend UI. Default can be up to 50x.
+**GRVT leverage**: API exists — `POST /full/v1/set_initial_leverage` and `GET /full/v1/get_all_initial_leverage`. Can also be set in GRVT frontend UI.
+
+**GRVT funding payments**: `POST /full/v1/funding_payment_history` returns per-settlement funding amounts. Use `start_time` in **nanoseconds**. Response: `result[].amount` (positive = received).
 
 ### HyENA Balance (Spot + Perps Combined)
 Query both `clearinghouseState` (dex=hyna) AND `spotClearinghouseState` and sum for true balance.
@@ -100,7 +106,7 @@ hyna:BTC order book can be momentarily empty. `open_position` retries up to 3 ti
 - `main.py exit` (cross-process) to load entry data for accurate PnL attribution
 
 ### PnL Attribution Report
-`print_exit_pnl()` outputs: funding income, position PnL, trading fees, slippage (bps + USD), NET PnL, external reward estimates (USDe + GRVT APR), and annualized APR. GRVT funding is estimated via balance-change method (no dedicated API).
+`print_exit_pnl()` outputs: funding income, position PnL, trading fees, slippage (bps + USD), NET PnL, external reward estimates (USDe + GRVT APR), and annualized APR. GRVT funding uses `funding_payment_history` API for precise values.
 
 ### Language
-Output strings and strategy commentary are in Chinese (中文).
+All script output is in English.

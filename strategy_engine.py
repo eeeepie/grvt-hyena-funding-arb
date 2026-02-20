@@ -49,14 +49,15 @@ class StrategyState:
     paused: bool = False
     # When not None, a self-initiated trade is in flight — skip mirror close check
     pending_trade: bool = False
-    # Double-confirmation for mirror close (防误触)
+    # Double-confirmation for mirror close (prevent false triggers)
     _pending_anomaly: Optional[dict] = None  # {"leg": str, "expected": float, "got": float, "time": float}
-    # ERROR retry state (失败后持续重试)
+    # ERROR retry state (keep retrying after failure)
     _retry_count: int = 0
     _retry_last_attempt: float = 0.0
     # Entry snapshot for PnL tracking
     entry_time: float = 0.0
     entry_h_balance: float = 0.0
+    entry_h_perps_margin: float = 0.0  # perps-only (for leverage calc)
     entry_g_balance: float = 0.0
     entry_h_mid: float = 0.0
     entry_g_mid: float = 0.0
@@ -74,7 +75,7 @@ class StrategyState:
         self._retry_count = 0
         self._retry_last_attempt = 0.0
         self.entry_time = 0.0
-        self.entry_h_balance = self.entry_g_balance = 0.0
+        self.entry_h_balance = self.entry_h_perps_margin = self.entry_g_balance = 0.0
         self.entry_h_mid = self.entry_g_mid = 0.0
         self.entry_h_fills = []
         self.entry_g_fills = []
@@ -85,6 +86,7 @@ class StrategyState:
         data = {
             "entry_time": self.entry_time,
             "entry_h_balance": self.entry_h_balance,
+            "entry_h_perps_margin": self.entry_h_perps_margin,
             "entry_g_balance": self.entry_g_balance,
             "entry_h_mid": self.entry_h_mid,
             "entry_g_mid": self.entry_g_mid,
@@ -109,6 +111,7 @@ class StrategyState:
                 data = json.load(f)
             self.entry_time = data["entry_time"]
             self.entry_h_balance = data["entry_h_balance"]
+            self.entry_h_perps_margin = data.get("entry_h_perps_margin", data["entry_h_balance"])
             self.entry_g_balance = data["entry_g_balance"]
             self.entry_h_mid = data["entry_h_mid"]
             self.entry_g_mid = data["entry_g_mid"]
@@ -154,6 +157,14 @@ class StrategyEngine:
     # --- Helpers ---
 
     @staticmethod
+    def _grvt_time_secs(t) -> float:
+        """Normalize GRVT timestamp (could be ns/ms/s) to seconds."""
+        t = int(str(t))
+        if t > 1e15: return t / 1e9
+        if t > 1e12: return t / 1e3
+        return float(t)
+
+    @staticmethod
     def _calc_vwap(fills: list) -> float:
         """VWAP from fills: Σ(px × sz) / Σ(sz). Returns 0 if no fills."""
         total_notional = sum(f["px"] * f["sz"] for f in fills if f.get("px") and f.get("sz"))
@@ -172,7 +183,7 @@ class StrategyEngine:
 
     async def open_position(self, usd_per_leg: float = None, max_leverage: float = None) -> bool:
         if self.state.state != PositionState.FLAT:
-            self.alerter.warning(f"无法开仓: 当前状态={self.state.state.value}")
+            self.alerter.warning(f"Cannot open: current state={self.state.state.value}")
             return False
 
         self.state.state = PositionState.ENTERING
@@ -180,15 +191,15 @@ class StrategyEngine:
         max_lev = max_leverage or self.config.max_leverage
 
         # 1. Pre-flight
-        self.alerter.info("开仓前检查...")
+        self.alerter.info("Pre-entry checks...")
         h_bal, g_bal = await self._both(self.hyena.get_balance, self.grvt.get_balance)
         self.alerter.info(f"  HyENA: {h_bal}  |  GRVT: {g_bal}")
 
         # 2. Get books
-        self.alerter.info("查询订单簿...")
+        self.alerter.info("Querying order books...")
         h_book, g_book = await self._both(self.hyena.get_book, self.grvt.get_book)
         if isinstance(h_book, Exception) or isinstance(g_book, Exception):
-            self.alerter.critical(f"订单簿失败: {h_book} / {g_book}")
+            self.alerter.critical(f"Order book failed: {h_book} / {g_book}")
             self.state.state = PositionState.FLAT
             return False
 
@@ -202,14 +213,14 @@ class StrategyEngine:
         qty = round(usd_per_leg / avg_mid, self.config.quantity_precision)
         # Enforce GRVT minimums
         if qty < 0.001:
-            self.alerter.critical(f"数量 {qty} BTC < GRVT 最小 0.001")
+            self.alerter.critical(f"Quantity {qty} BTC < GRVT minimum 0.001")
             self.state.state = PositionState.FLAT
             return False
         if qty * avg_mid < 100:
-            self.alerter.critical(f"名义值 ${qty * avg_mid:.2f} < GRVT 最小 $100")
+            self.alerter.critical(f"Notional ${qty * avg_mid:.2f} < GRVT minimum $100")
             self.state.state = PositionState.FLAT
             return False
-        self.alerter.info(f"  开仓数量: {qty} BTC (≈ ${qty * avg_mid:,.2f}/腿)")
+        self.alerter.info(f"  Entry qty: {qty} BTC (approx ${qty * avg_mid:,.2f}/leg)")
 
         # 2c. Leverage guard
         notional = qty * avg_mid
@@ -220,11 +231,11 @@ class StrategyEngine:
 
         if h_eff_lev > max_lev or g_eff_lev > max_lev:
             self.alerter.critical(
-                f"杠杆超限! HyENA={h_eff_lev:.1f}x GRVT={g_eff_lev:.1f}x > {max_lev:.0f}x — 中止开仓"
+                f"Leverage exceeded! HyENA={h_eff_lev:.1f}x GRVT={g_eff_lev:.1f}x > {max_lev:.0f}x -- aborting entry"
             )
             self.state.state = PositionState.FLAT
             return False
-        self.alerter.info(f"  杠杆检查: HyENA={h_eff_lev:.1f}x GRVT={g_eff_lev:.1f}x (上限{max_lev:.0f}x) ✓")
+        self.alerter.info(f"  Leverage check: HyENA={h_eff_lev:.1f}x GRVT={g_eff_lev:.1f}x (max {max_lev:.0f}x) OK")
 
         # 3–5. Submit orders with retry (hyna:BTC liquidity can be thin)
         self.state.pending_trade = True
@@ -232,11 +243,11 @@ class StrategyEngine:
         for attempt in range(max_entry_retries):
             # Re-query book on retry to get fresh prices
             if attempt > 0:
-                self.alerter.info(f"开仓重试 {attempt}/{max_entry_retries - 1}: 重新获取订单簿...")
+                self.alerter.info(f"Entry retry {attempt}/{max_entry_retries - 1}: re-fetching order books...")
                 await asyncio.sleep(2)
                 h_book, g_book = await self._both(self.hyena.get_book, self.grvt.get_book)
                 if isinstance(h_book, Exception) or isinstance(g_book, Exception):
-                    self.alerter.warning(f"订单簿获取失败，继续重试...")
+                    self.alerter.warning(f"Order book fetch failed, continuing retry...")
                     continue
 
             # Price offset: 5bps first try, 10bps on retry (hyna:BTC book can be thin)
@@ -246,7 +257,7 @@ class StrategyEngine:
             sell_px = round(g_book["mid"] * (1 - offset), 1)   # GRVT tick = $0.1
 
             self.alerter.info(
-                f"并发下单{f' (重试{attempt})' if attempt else ''}: "
+                f"Submitting orders{f' (retry {attempt})' if attempt else ''}: "
                 f"HyENA BUY {qty}@${buy_px:,.0f} | GRVT SELL {qty}@${sell_px:,.1f}"
             )
 
@@ -267,7 +278,7 @@ class StrategyEngine:
                 h_pos, g_pos = await self._both(self.hyena.get_position, self.grvt.get_position)
                 self.state.load_from_exchange(h_pos, g_pos)
                 self.state.pending_trade = False
-                self.alerter.info(f"仓位开启! HyENA:{self.state.hyena.size:+.4f} GRVT:{self.state.grvt.size:+.4f}")
+                self.alerter.info(f"Position opened! HyENA:{self.state.hyena.size:+.4f} GRVT:{self.state.grvt.size:+.4f}")
 
                 # Record entry snapshot
                 entry_ms = int(time.time() * 1000) - 30000
@@ -275,13 +286,14 @@ class StrategyEngine:
                 self.state.entry_h_mid = h_book["mid"]
                 self.state.entry_g_mid = g_book["mid"]
                 self.state.entry_h_balance = h_bal.get("account_value", 0) if isinstance(h_bal, dict) else 0
+                self.state.entry_h_perps_margin = h_bal.get("perps_margin", self.state.entry_h_balance) if isinstance(h_bal, dict) else 0
                 self.state.entry_g_balance = g_bal.get("total_equity", 0) if isinstance(g_bal, dict) else 0
 
                 await self._print_entry_costs(entry_ms, h_book["mid"], g_book["mid"])
                 self.state.save_entry_state()
 
                 if abs(abs(self.state.hyena.size) - abs(self.state.grvt.size)) > self.config.qty_mismatch_threshold:
-                    self.alerter.warning("BTC数量不匹配!")
+                    self.alerter.warning("BTC quantity mismatch!")
                 return True
 
             # One side failed — if it's a retryable IOC rejection on HyENA, and GRVT
@@ -289,32 +301,32 @@ class StrategyEngine:
             # But if GRVT succeeded and HyENA failed, must unwind GRVT first.
 
             if h_ok and not g_ok:
-                self.alerter.emergency(f"GRVT失败! {g_res}. 正在关闭HyENA...")
+                self.alerter.emergency(f"GRVT failed! {g_res}. Closing HyENA...")
                 try:
                     await asyncio.to_thread(self.hyena.market_close, qty)
                 except Exception as e:
-                    self.alerter.emergency(f"HyENA关仓也失败: {e}")
+                    self.alerter.emergency(f"HyENA close also failed: {e}")
                 break  # Don't retry — one side was filled + unwound
 
             if g_ok and not h_ok:
                 # Check if GRVT actually filled (status might be PENDING with traded_size=0)
                 g_filled = self._check_grvt_filled(g_res)
                 if g_filled:
-                    self.alerter.emergency(f"HyENA失败! {h_res}. GRVT已成交，正在关闭GRVT...")
+                    self.alerter.emergency(f"HyENA failed! {h_res}. GRVT filled, closing GRVT...")
                     try:
                         await asyncio.to_thread(self.grvt.market_close, qty, False)
                     except Exception as e:
-                        self.alerter.emergency(f"GRVT关仓也失败: {e}")
+                        self.alerter.emergency(f"GRVT close also failed: {e}")
                     break  # Don't retry — GRVT was filled + unwound
                 else:
                     # GRVT was PENDING/not filled — can retry both
                     h_err_msg = str(h_res) if isinstance(h_res, Exception) else ""
                     is_ioc_reject = "could not immediately match" in h_err_msg.lower()
                     if is_ioc_reject and attempt < max_entry_retries - 1:
-                        self.alerter.warning(f"HyENA IOC 未成交 (book可能为空), GRVT未成交 → 重试")
+                        self.alerter.warning(f"HyENA IOC not filled (book may be empty), GRVT not filled -> retrying")
                         continue
                     else:
-                        self.alerter.critical(f"HyENA失败: {h_res}")
+                        self.alerter.critical(f"HyENA failed: {h_res}")
                         break
 
             # Both failed
@@ -322,9 +334,9 @@ class StrategyEngine:
                 h_err_msg = str(h_res) if isinstance(h_res, Exception) else ""
                 is_ioc_reject = "could not immediately match" in h_err_msg.lower()
                 if is_ioc_reject and attempt < max_entry_retries - 1:
-                    self.alerter.warning(f"双边都未成交 → 重试")
+                    self.alerter.warning(f"Both sides not filled -> retrying")
                     continue
-                self.alerter.critical(f"双边都失败: {h_res} / {g_res}")
+                self.alerter.critical(f"Both sides failed: {h_res} / {g_res}")
                 break
 
         self.state.reset()
@@ -363,10 +375,14 @@ class StrategyEngine:
             if isinstance(g_fills, Exception):
                 g_fills = []
 
+            # Filter GRVT fills by time (entry_ms in ms, GRVT time format unknown)
+            entry_secs = entry_ms / 1000
+            g_fills = [f for f in g_fills if self._grvt_time_secs(f.get("time", 0)) >= entry_secs - 60]
+
             self.state.entry_h_fills = h_fills
             self.state.entry_g_fills = g_fills
 
-            lines = ["\n── 开仓成本 ──"]
+            lines = ["\n-- Entry Costs --"]
             total_fee = 0.0
 
             if h_fills:
@@ -375,7 +391,7 @@ class StrategyEngine:
                 lines.append(f"  HyENA BUY:  fill ${f['px']:,.0f} | mid ${h_mid:,.0f} → slippage {slip_bps:.1f}bps | fee ${f['fee']:.4f}")
                 total_fee += f["fee"]
             else:
-                lines.append("  HyENA: 未获取到成交记录")
+                lines.append("  HyENA: no fill records found")
 
             if g_fills:
                 f = g_fills[0]
@@ -384,9 +400,9 @@ class StrategyEngine:
                 lines.append(f"  GRVT SELL:  fill ${f['px']:,.1f} | mid ${g_mid:,.1f} → slippage {slip_bps:.1f}bps | fee ${f['fee']:.4f} ({fee_pct:.3f}%)")
                 total_fee += f["fee"]
             else:
-                lines.append("  GRVT: 未获取到成交记录")
+                lines.append("  GRVT: no fill records found")
 
-            lines.append(f"  总开仓费用: ${total_fee:.4f}")
+            lines.append(f"  Total entry fees: ${total_fee:.4f}")
             lines.append("")
             print("\n".join(lines), flush=True)
         except Exception as e:
@@ -420,6 +436,9 @@ class StrategyEngine:
                 g_fills = []
 
             h_exit_fills = [f for f in h_fills if f.get("dir") == "Close Long" or f.get("side") == "A"]
+            # Filter GRVT fills by time
+            entry_secs = entry_ms / 1000
+            g_fills = [f for f in g_fills if self._grvt_time_secs(f.get("time", 0)) >= entry_secs - 60]
             g_exit_fills = [f for f in g_fills if f.get("is_buyer")]
 
             if has_snapshot and self.state.entry_h_fills:
@@ -467,8 +486,15 @@ class StrategyEngine:
                 except Exception:
                     pass
 
-            g_rpnl = sum(f.get("realized_pnl", 0) for f in g_exit_fills)
-            funding_total = h_funding + g_rpnl
+            g_funding = 0.0
+            try:
+                start_ns = int(self.state.entry_time * 1e9) if has_snapshot else int((time.time() - 86400 * 30) * 1e9)
+                g_funding = await asyncio.to_thread(
+                    self.grvt.get_funding_payments, start_ns
+                )
+            except Exception:
+                pass
+            funding_total = h_funding + g_funding
 
             # ── Fees ──
             h_entry_fee = sum(f["fee"] for f in h_entry_fills)
@@ -526,19 +552,22 @@ class StrategyEngine:
             def _pct(val):
                 return val / abs_sum * 100 if abs_sum > 0 else 0
 
-            # ── Leverage at entry ──
-            h_equity_entry = self.state.entry_h_balance if has_snapshot else (
-                pre_h_bal.get("account_value", 0) if isinstance(pre_h_bal, dict) else 0)
-            g_equity_entry = self.state.entry_g_balance if has_snapshot else (
-                pre_g_bal.get("total_equity", 0) if isinstance(pre_g_bal, dict) else 0)
+            # ── Leverage (margin used, not total equity) ──
+            h_equity_entry = self.state.entry_h_perps_margin if has_snapshot else (
+                pre_h_bal.get("perps_margin", pre_h_bal.get("account_value", 0)) if isinstance(pre_h_bal, dict) else 0)
             h_lev = h_notional / h_equity_entry if h_equity_entry > 0 else 0
-            g_lev = g_notional / g_equity_entry if g_equity_entry > 0 else 0
+            # GRVT: margin used = total_equity - available_balance
+            if isinstance(pre_g_bal, dict) and pre_g_bal.get("available_balance") is not None:
+                g_margin = pre_g_bal.get("total_equity", 0) - pre_g_bal.get("available_balance", 0)
+            else:
+                g_margin = self.state.entry_g_balance if has_snapshot else 0
+            g_lev = g_notional / g_margin if g_margin > 0 else 0
 
             # ── Print report ──
             W = 54
             lines = []
             lines.append(f"\n{'═' * W}")
-            lines.append(f"  平仓损益报告")
+            lines.append(f"  Close Position PnL Report")
             lines.append(f"{'═' * W}")
 
             # Holding period
@@ -547,20 +576,20 @@ class StrategyEngine:
                 hours = int((hold_secs % 86400) // 3600)
                 mins = int((hold_secs % 3600) // 60)
                 hold_str = f"{days}d {hours}h {mins}m" if days else f"{hours}h {mins}m"
-                lines.append(f"\n  持仓: {hold_str}")
+                lines.append(f"\n  Holding: {hold_str}")
 
             # Position summary
-            lines.append(f"  仓位: Long hyna:BTC / Short BTC_USDT_Perp")
-            lines.append(f"  数量: {avg_size:.5f} BTC (≈ ${avg_size * (h_entry_px or g_entry_px):,.0f}/腿)")
+            lines.append(f"  Position: Long hyna:BTC / Short BTC_USDT_Perp")
+            lines.append(f"  Size: {avg_size:.5f} BTC (approx ${avg_size * (h_entry_px or g_entry_px):,.0f}/leg)")
             if h_lev > 0 or g_lev > 0:
-                lines.append(f"  杠杆: HyENA {h_lev:.1f}x / GRVT {g_lev:.1f}x")
+                lines.append(f"  Leverage: HyENA {h_lev:.1f}x / GRVT {g_lev:.1f}x")
 
             # PnL Attribution
-            lines.append(f"\n  ── PnL 归因 ──")
+            lines.append(f"\n  -- PnL Attribution --")
 
             lines.append(f"    Funding Income:          {funding_total:+10.2f}     ({_pct(funding_total):+5.1f}%)")
             lines.append(f"      HyENA (long):              {h_funding:+.2f}")
-            lines.append(f"      GRVT realized_pnl:         {g_rpnl:+.2f}  (含funding结算)")
+            lines.append(f"      GRVT (short):              {g_funding:+.2f}")
 
             lines.append(f"    Position PnL:            {pos_total:+10.2f}     ({_pct(pos_total):+5.1f}%)")
             if h_entry_px and h_exit_px:
@@ -569,40 +598,40 @@ class StrategyEngine:
                 lines.append(f"      GRVT:  ${g_entry_px:,.1f} → ${g_exit_px:,.1f}    {g_pos_pnl:+.2f}")
 
             lines.append(f"    Trading Fees:            {-fee_total:+10.2f}     ({_pct(-fee_total):+5.1f}%)")
-            lines.append(f"      开仓: H ${h_entry_fee:.2f} + G ${g_entry_fee:.2f}")
-            lines.append(f"      平仓: H ${h_exit_fee:.2f} + G ${g_exit_fee:.2f}")
+            lines.append(f"      Entry: H ${h_entry_fee:.2f} + G ${g_entry_fee:.2f}")
+            lines.append(f"      Exit:  H ${h_exit_fee:.2f} + G ${g_exit_fee:.2f}")
 
             lines.append(f"    Slippage:                {-slip_total:+10.2f}     ({_pct(-slip_total):+5.1f}%)")
-            lines.append(f"      开仓: H {h_entry_slip:.1f}bps / G {g_entry_slip:.1f}bps")
-            lines.append(f"      平仓: H {h_exit_slip:.1f}bps / G {g_exit_slip:.1f}bps")
+            lines.append(f"      Entry: H {h_entry_slip:.1f}bps / G {g_entry_slip:.1f}bps")
+            lines.append(f"      Exit:  H {h_exit_slip:.1f}bps / G {g_exit_slip:.1f}bps")
 
             lines.append(f"    {'─' * 37}")
-            lines.append(f"    实际 NET PnL:           {net_pnl:+10.2f}")
+            lines.append(f"    Realized NET PnL:       {net_pnl:+10.2f}")
 
             # External rewards
             if holding_days > 0:
-                lines.append(f"\n  ── External Rewards (估算) ──")
+                lines.append(f"\n  -- External Rewards (estimated) --")
                 lines.append(f"    USDe staking ({self.config.usde_reward_apr:.0f}% APR):  {usde_reward:+.2f}")
                 lines.append(f"    GRVT equity ({self.config.grvt_reward_apr:.0f}% APR):   {grvt_reward:+.2f}")
-                lines.append(f"    Reward 合计:             {reward_total:+.2f}")
+                lines.append(f"    Reward total:            {reward_total:+.2f}")
 
             # Annualized returns
             if nav_before > 0 and holding_days > 0:
                 nav_change = nav_after - nav_before
                 nav_pct = nav_change / nav_before * 100
-                lines.append(f"\n  ── 年化收益 ──")
+                lines.append(f"\n  -- Annualized Returns --")
                 lines.append(f"    NAV: ${nav_before:,.2f} → ${nav_after:,.2f}  ({nav_pct:+.3f}%)")
-                lines.append(f"    APR (纯交易):     {trade_apr:+.1f}%")
-                lines.append(f"    APR (含rewards):  {total_apr:+.1f}%")
+                lines.append(f"    APR (trading):    {trade_apr:+.1f}%")
+                lines.append(f"    APR (w/ rewards): {total_apr:+.1f}%")
             elif nav_before == 0:
-                lines.append(f"\n  (无开仓NAV快照，无法计算年化)")
+                lines.append(f"\n  (No entry NAV snapshot, cannot compute annualized return)")
 
             lines.append(f"{'═' * W}\n")
             print("\n".join(lines), flush=True)
 
         except Exception as e:
             logger.error(f"Exit PnL report failed: {e}")
-            print(f"\n  ⚠ 损益报告生成失败: {e}", flush=True)
+            print(f"\n  WARNING: PnL report generation failed: {e}", flush=True)
 
     # ── Mirror Close ───────────────────────────────────────────────────────
 
@@ -614,14 +643,14 @@ class StrategyEngine:
         2. Normal detection — OPEN state → double-confirmation before triggering
         3. Skip — any other state or pending_trade
         """
-        # ── Mode 1: ERROR retry (失败后持续重试，永不放弃) ──
+        # -- Mode 1: ERROR retry (keep retrying after failure, never give up) --
         if self.state.state == PositionState.ERROR and self.state.mirror_close_active:
             elapsed = time.time() - self.state._retry_last_attempt
             base = self.mon_config.mirror_close_retry_base
             cap = self.mon_config.mirror_close_retry_max
             backoff = min(base * (2 ** self.state._retry_count), cap)
             if elapsed >= backoff:
-                self.alerter.warning(f"Mirror Close重试 #{self.state._retry_count + 1} (退避{backoff}s)")
+                self.alerter.warning(f"Mirror Close retry #{self.state._retry_count + 1} (backoff {backoff}s)")
                 await self._emergency_close_all()
             return
 
@@ -655,7 +684,7 @@ class StrategyEngine:
         if not anomaly_detected:
             # Normal — update last_known and clear any pending anomaly
             if self.state._pending_anomaly:
-                self.alerter.info(f"Mirror Close: 误报消除 (上次异常腿={self.state._pending_anomaly['leg']})")
+                self.alerter.info(f"Mirror Close: false alarm cleared (prev anomaly leg={self.state._pending_anomaly['leg']})")
                 self.state._pending_anomaly = None
             for leg, pos in [(self.state.hyena, h_pos), (self.state.grvt, g_pos)]:
                 leg.last_known_size = pos.get("size", 0)
@@ -666,13 +695,13 @@ class StrategyEngine:
         if self.state._pending_anomaly is None:
             self.state._pending_anomaly = anomaly_info
             self.alerter.warning(
-                f"{anomaly_info['leg']}仓位异常，等待确认... "
-                f"({anomaly_info['expected']:+.4f} → {anomaly_info['got']:+.4f})"
+                f"{anomaly_info['leg']} position anomaly, awaiting confirmation... "
+                f"({anomaly_info['expected']:+.4f} -> {anomaly_info['got']:+.4f})"
             )
             return
 
         # Second detection (next poll) → re-poll to confirm
-        self.alerter.warning("Mirror Close: 二次确认，重新查询仓位...")
+        self.alerter.warning("Mirror Close: second confirmation, re-querying positions...")
         h_pos2, g_pos2 = await self._poll_both_positions()
         if h_pos2 is None or g_pos2 is None:
             return  # poll failed, keep pending_anomaly for next cycle
@@ -687,7 +716,7 @@ class StrategyEngine:
                 break
 
         if not still_anomalous:
-            self.alerter.info("Mirror Close: 二次确认通过，异常已恢复，误报消除")
+            self.alerter.info("Mirror Close: second confirmation passed, anomaly resolved, false alarm cleared")
             self.state._pending_anomaly = None
             for leg, pos in [(self.state.hyena, h_pos2), (self.state.grvt, g_pos2)]:
                 leg.last_known_size = pos.get("size", 0)
@@ -696,8 +725,8 @@ class StrategyEngine:
 
         # Confirmed anomaly — trigger emergency close all
         self.alerter.emergency(
-            f"Mirror Close确认! {self.state._pending_anomaly['leg']}仓位异变 "
-            f"({self.state._pending_anomaly['expected']:+.4f} → {self.state._pending_anomaly['got']:+.4f})"
+            f"Mirror Close confirmed! {self.state._pending_anomaly['leg']} position changed "
+            f"({self.state._pending_anomaly['expected']:+.4f} -> {self.state._pending_anomaly['got']:+.4f})"
         )
         self.state._pending_anomaly = None
         await self._emergency_close_all()
@@ -709,7 +738,7 @@ class StrategyEngine:
         except Exception as e:
             self._poll_fails["hyena"] += 1
             if self._poll_fails["hyena"] >= self.mon_config.api_failure_threshold:
-                self.alerter.critical(f"HyENA poll连续失败 {self._poll_fails['hyena']}x: {e}")
+                self.alerter.critical(f"HyENA poll consecutive failures {self._poll_fails['hyena']}x: {e}")
             return None, None
 
         try:
@@ -717,7 +746,7 @@ class StrategyEngine:
         except Exception as e:
             self._poll_fails["grvt"] += 1
             if self._poll_fails["grvt"] >= self.mon_config.api_failure_threshold:
-                self.alerter.critical(f"GRVT poll连续失败 {self._poll_fails['grvt']}x: {e}")
+                self.alerter.critical(f"GRVT poll consecutive failures {self._poll_fails['grvt']}x: {e}")
             return None, None
 
         # Check for API-level errors (e.g. auth expired returning size=0)
@@ -725,7 +754,7 @@ class StrategyEngine:
             if pos.get("error"):
                 self._poll_fails[name] += 1
                 if self._poll_fails[name] >= self.mon_config.api_failure_threshold:
-                    self.alerter.critical(f"{name} position查询异常(连续{self._poll_fails[name]}次): {pos['error']}")
+                    self.alerter.critical(f"{name} position query error (consecutive {self._poll_fails[name]}x): {pos['error']}")
                 return None, None
             self._poll_fails[name] = 0
 
@@ -740,11 +769,11 @@ class StrategyEngine:
         g_sz = g_pos.get("size", 0) if isinstance(g_pos, dict) else 0
 
         if abs(h_sz) < 0.001 and abs(g_sz) < 0.001:
-            self.alerter.emergency("两腿都已无仓位，紧急全平完成")
+            self.alerter.emergency("Both legs already flat, emergency close complete")
             self.state.reset()
             return
 
-        self.alerter.emergency(f"紧急全平: HyENA={h_sz:+.4f} GRVT={g_sz:+.4f}")
+        self.alerter.emergency(f"Emergency close all: HyENA={h_sz:+.4f} GRVT={g_sz:+.4f}")
 
         # Close both legs concurrently (each with independent error handling)
         h_ok, g_ok = True, True
@@ -756,16 +785,16 @@ class StrategyEngine:
             h_result, g_result = results
             if isinstance(h_result, Exception):
                 h_ok = False
-                self.alerter.emergency(f"HyENA平仓失败: {h_result}")
+                self.alerter.emergency(f"HyENA close failed: {h_result}")
             if isinstance(g_result, Exception):
                 g_ok = False
-                self.alerter.emergency(f"GRVT平仓失败: {g_result}")
+                self.alerter.emergency(f"GRVT close failed: {g_result}")
         except Exception as e:
             h_ok = g_ok = False
-            self.alerter.emergency(f"紧急全平异常: {e}")
+            self.alerter.emergency(f"Emergency close exception: {e}")
 
         if h_ok and g_ok:
-            self.alerter.emergency("紧急全平成功 ✓")
+            self.alerter.emergency("Emergency close all succeeded")
             self.state.reset()
         else:
             # Partial or full failure → enter ERROR, keep retrying
@@ -773,8 +802,8 @@ class StrategyEngine:
             self.state._retry_count += 1
             self.state._retry_last_attempt = time.time()
             self.alerter.emergency(
-                f"紧急全平部分失败! 进入ERROR状态，将持续重试 "
-                f"(第{self.state._retry_count}次, 下次退避"
+                f"Emergency close partially failed! Entering ERROR state, will keep retrying "
+                f"(attempt #{self.state._retry_count}, next backoff "
                 f"{min(self.mon_config.mirror_close_retry_base * (2 ** self.state._retry_count), self.mon_config.mirror_close_retry_max)}s)"
             )
 
@@ -782,7 +811,7 @@ class StrategyEngine:
 
     async def close_position(self) -> bool:
         if self.state.state not in (PositionState.OPEN, PositionState.ERROR):
-            self.alerter.warning(f"无法平仓: 状态={self.state.state.value}")
+            self.alerter.warning(f"Cannot close: state={self.state.state.value}")
             return False
 
         self.state.state = PositionState.CLOSING
@@ -794,11 +823,11 @@ class StrategyEngine:
         g_sz = g_pos.get("size", 0) if isinstance(g_pos, dict) else self.state.grvt.size
 
         if abs(h_sz) < 0.001 and abs(g_sz) < 0.001:
-            self.alerter.info("双边已无持仓，无需平仓")
+            self.alerter.info("Both sides already flat, no close needed")
             self.state.reset()
             return True
 
-        self.alerter.info(f"并发平仓: HyENA={h_sz:+.4f} GRVT={g_sz:+.4f}")
+        self.alerter.info(f"Closing concurrently: HyENA={h_sz:+.4f} GRVT={g_sz:+.4f}")
         results = await self._both(
             lambda: self.hyena.market_close(h_sz) if abs(h_sz) >= 0.001 else None,
             lambda: self.grvt.market_close(abs(g_sz), g_sz > 0) if abs(g_sz) >= 0.001 else None,
@@ -806,13 +835,13 @@ class StrategyEngine:
 
         h_result, g_result = results
         if isinstance(h_result, Exception):
-            self.alerter.warning(f"HyENA平仓异常: {h_result}")
+            self.alerter.warning(f"HyENA close error: {h_result}")
         else:
-            self.alerter.info(f"HyENA平仓: {h_result}")
+            self.alerter.info(f"HyENA close: {h_result}")
         if isinstance(g_result, Exception):
-            self.alerter.warning(f"GRVT平仓异常: {g_result}")
+            self.alerter.warning(f"GRVT close error: {g_result}")
         else:
-            self.alerter.info(f"GRVT平仓: {g_result}")
+            self.alerter.info(f"GRVT close: {g_result}")
 
         # Verify + retry residual (up to 2 retries per leg)
         all_closed = False
@@ -823,31 +852,31 @@ class StrategyEngine:
             g_rem = g_pos.get("size", 0) if not isinstance(g_pos, Exception) else 999
 
             if abs(h_rem) < 0.001 and abs(g_rem) < 0.001:
-                self.alerter.info("双边已完全平仓 ✓")
+                self.alerter.info("Both sides fully closed")
                 all_closed = True
                 break
 
             if retry < 2:
-                self.alerter.warning(f"残留仓位 (retry {retry + 1}/2): HyENA={h_rem:.4f} GRVT={g_rem:.4f}")
+                self.alerter.warning(f"Residual position (retry {retry + 1}/2): HyENA={h_rem:.4f} GRVT={g_rem:.4f}")
                 # Retry only the failed leg(s) sequentially
                 if abs(h_rem) >= 0.001:
                     try:
                         r = await asyncio.to_thread(self.hyena.market_close, h_rem)
-                        self.alerter.info(f"HyENA重试: {r}")
+                        self.alerter.info(f"HyENA retry: {r}")
                     except Exception as e:
-                        self.alerter.warning(f"HyENA重试失败: {e}")
+                        self.alerter.warning(f"HyENA retry failed: {e}")
                 if abs(g_rem) >= 0.001:
                     try:
                         r = await asyncio.to_thread(
                             self.grvt.market_close, abs(g_rem), g_rem > 0
                         )
-                        self.alerter.info(f"GRVT重试: {r}")
+                        self.alerter.info(f"GRVT retry: {r}")
                     except Exception as e:
-                        self.alerter.warning(f"GRVT重试失败: {e}")
+                        self.alerter.warning(f"GRVT retry failed: {e}")
 
         if not all_closed:
             self.alerter.critical(
-                f"平仓不完整! 残留: HyENA={h_rem:.4f} GRVT={g_rem:.4f} — 请手动处理"
+                f"Close incomplete! Residual: HyENA={h_rem:.4f} GRVT={g_rem:.4f} -- manual intervention needed"
             )
 
         self.state.reset()
@@ -866,10 +895,10 @@ class StrategyEngine:
 
             max_lev = self.config.max_leverage
             if h_lev > max_lev:
-                self.alerter.warning(f"HyENA杠杆 {h_lev:.1f}x > {max_lev:.0f}x! 需追加保证金.")
+                self.alerter.warning(f"HyENA leverage {h_lev:.1f}x > {max_lev:.0f}x! Need to add margin.")
             if g_lev > max_lev:
-                self.alerter.warning(f"GRVT杠杆 {g_lev:.1f}x > {max_lev:.0f}x! 需追加保证金.")
+                self.alerter.warning(f"GRVT leverage {g_lev:.1f}x > {max_lev:.0f}x! Need to add margin.")
             if abs(h_lev - g_lev) > self.config.leverage_diff_trigger:
-                self.alerter.warning(f"杠杆差: HyENA={h_lev:.1f}x GRVT={g_lev:.1f}x. 建议调整.")
+                self.alerter.warning(f"Leverage diff: HyENA={h_lev:.1f}x GRVT={g_lev:.1f}x. Consider rebalancing.")
         except Exception as e:
             self.alerter.warning(f"Rebalance check error: {e}")

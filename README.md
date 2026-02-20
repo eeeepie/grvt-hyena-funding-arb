@@ -1,8 +1,13 @@
-# BTC Funding Rate Arbitrage System
+# Grvt < > HyENA BTC Funding Rate Arbitrage System
 
 Delta-neutral funding rate arb: **Long HyENA** (`hyna:BTC`) + **Short GRVT** (`BTC_USDT_Perp`).
 
 Core alpha = stacking margin rewards (USDe 12% + GRVT 10% = **22% APR base**), not the funding spread itself.
+
+| | Reward Basis | Note |
+|--|-------------|------|
+| **HyENA 12% APR** | `min(USDe balance, long notional)` | Leverage multiplies reward; keep USDe balance ≥ notional |
+| **GRVT 10% APR** | Account equity (margin only) | Leverage-agnostic; tiered caps at 1K / 20K / 100K USDT |
 
 > Full strategy spec & backtest: `PRD_Cross_Exchange_Funding_Rate_Arbitrage_v3.md`
 
@@ -29,21 +34,20 @@ python3 main.py entry               # open positions (interactive)
 | `python3 main.py entry` | Interactive entry: set USD amount & max leverage → open + monitor |
 | `python3 main.py monitor` | Re-attach monitoring to existing positions (Ctrl+C to stop) |
 | `python3 main.py exit` | Close both legs simultaneously + PnL attribution report |
-| `python3 mtm.py` | Mark-to-market PnL snapshot (不平仓) |
+| `python3 mtm.py` | Mark-to-market PnL snapshot |
 
 ### Entry Flow
 
 ```
-── 开仓参数 ──
+── Entry Parameters ──
 
-  ⚠  请先在 GRVT 前端确认杠杆倍数!
-     grvt.io → BTC_USDT_Perp → 调整杠杆至目标倍数
+  USD per leg [100.0]: 200
+  Max leverage [3.0x]: 2
 
-  每腿金额 USD [100.0]: 200
-  最大杠杆倍数 [3.0x]: 2
+  GRVT leverage: 3x OK
 
-  → 每腿 $200 | 最大杠杆 2.0x
-  确认开仓? [y/N]: y
+  -> $200 per leg | max leverage 2.0x
+  Confirm entry? [y/N]: y
 ```
 
 BTC quantity is auto-calculated from USD amount and live price.
@@ -63,13 +67,6 @@ You need 4 credentials in `.env`:
 
 > `.env` is git-ignored — your keys never leave your machine.
 
-### Pre-flight Checklist
-
-Before first entry:
-- [ ] Both exchanges say "Connected" in `status`
-- [ ] Both balances show sufficient funds
-- [ ] **GRVT leverage set to 2–3x in frontend UI** (grvt.io → BTC_USDT_Perp)
-- [ ] USDe is pegged (~$1.00)
 
 ---
 
@@ -77,7 +74,7 @@ Before first entry:
 
 | Task | Interval | Purpose |
 |------|----------|---------|
-| Position poll | 10s | Mirror close: if one leg gets ADL'd, auto-close the other |
+| Position poll | 10s | **Mirror close: if one leg gets ADL'd, auto-close the other** |
 | Funding rates | 5min | Log to CSV, alert if spread stays negative 6h+ |
 | USDe peg | 1min | Alert at 0.5% depeg, emergency at 1% |
 | Circuit breaker | 1min | Pause if BTC moves >15% in 1h |
@@ -121,8 +118,41 @@ data/entry_state.json ← Entry snapshot (auto-managed)
 
 ---
 
+## Account Setup
+
+If you don't have exchange accounts yet, signing up through these links helps support the project:
+
+- **GRVT**: [https://grvt.io/?ref=eeeeepie](https://grvt.io/?ref=eeeeepie)
+- **HyENA / Hyperliquid**: Sign up at [app.hyena.trade](https://app.hyena.trade)
+
+> **GRVT leverage**: Must be set manually in the GRVT frontend (API is deprecated). Go to grvt.io -> BTC_USDT_Perp -> adjust leverage to your target before running `entry`.
+
+---
+
+## Fees & Transparency
+
+This script includes a **1 bps (0.01%) Hyperliquid builder fee** on HyENA trades. This is how the project sustains itself — a tiny fraction of each trade goes to the developer via Hyperliquid's native [builder mechanism](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/builder-codes).
+
+The builder address and fee are visible in `config.py` — nothing is hidden.
+
+---
+
 ## Security Notes
 
 - **`.env` is git-ignored** — keys never committed
 - **To revoke access**: delete `.env`, or revoke GRVT API key in their UI
 - **Wallet keys**: if compromised, move funds immediately via exchange UI
+
+---
+
+## Support This Project
+
+Building and maintaining a production-grade arbitrage system takes effort, especially with Grvt's suck API.
+
+This project is open source and will continue to be actively maintained. If it helps you earn yield, consider supporting its development:
+
+- **Use the referral links above** (https://grvt.io/?ref=eeeeepie) when creating your accounts
+- **Star this repo** to help others find it
+- **Report issues** — bug reports and feature requests keep the project improving
+
+Thank you for your support. Great supporters get dev's feet pics. (wink wink;^)

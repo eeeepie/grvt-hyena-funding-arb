@@ -88,7 +88,7 @@ class HyenaClient:
         return self.get_book()["mid"]
 
     def get_funding_rate(self) -> dict:
-        # 已结算费率 (fundingHistory)
+        # Settled rate (fundingHistory)
         start = int((datetime.now(timezone.utc) - timedelta(hours=12)).timestamp() * 1000)
         hist = self._post({"type": "fundingHistory", "coin": self.coin, "startTime": start})
         if not hist:
@@ -99,7 +99,7 @@ class HyenaClient:
             r8h = r1h * 8
             ts = datetime.fromtimestamp(hist[-1]["time"] / 1000, tz=timezone.utc)
 
-        # 预测费率 (assetCtx)
+        # Predicted rate (assetCtx)
         pred_1h = pred_8h = pred_ann = 0.0
         try:
             meta = self._post({"type": "metaAndAssetCtxs", "dex": self.dex})
@@ -499,6 +499,25 @@ class GrvtClient:
         except Exception as e:
             return {"balance": 0.0, "error": str(e)}
 
+    # --- Leverage ---
+
+    def get_leverage(self) -> float:
+        """Get current initial leverage for BTC_USDT_Perp. Returns 0 on failure."""
+        self._require_auth()
+        try:
+            data = self._trade_post("/full/v1/get_all_initial_leverage", {})
+            # Response uses "results" (plural), not "result"
+            results = data.get("results", data.get("result", [])) if isinstance(data, dict) else []
+            for item in results:
+                if item.get("instrument") == self.instrument:
+                    return safe_float(item.get("leverage"))
+            return 0.0
+        except Exception as e:
+            logger.error(f"GRVT get_leverage failed: {e}")
+            return 0.0
+
+    # set_initial_leverage API deprecated (2026-02) — must use GRVT frontend
+
     # --- Fill History ---
 
     def get_fills(self, limit: int = 20) -> list:
@@ -524,6 +543,26 @@ class GrvtClient:
         except Exception as e:
             logger.error(f"GRVT get_fills failed: {e}")
             return []
+
+    def get_funding_payments(self, start_time_ns: int = 0, limit: int = 100) -> float:
+        """Get accumulated funding payments. Returns total amount (positive = received)."""
+        self._require_auth()
+        try:
+            payload = {
+                "sub_account_id": self._sub_account_id,
+                "instrument": self.instrument,
+                "limit": limit,
+            }
+            if start_time_ns > 0:
+                payload["start_time"] = str(start_time_ns)
+            data = self._trade_post("/full/v1/funding_payment_history", payload)
+            results = data.get("result", []) if isinstance(data, dict) else []
+            total = sum(safe_float(r.get("amount", 0)) for r in results)
+            logger.info(f"GRVT funding payments: {len(results)} records, total={total:.4f}")
+            return total
+        except Exception as e:
+            logger.error(f"GRVT get_funding_payments failed: {e}")
+            return 0.0
 
     # --- EIP-712 Order Signing ---
 

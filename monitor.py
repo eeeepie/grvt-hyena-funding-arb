@@ -85,6 +85,7 @@ class Monitor:
 
         h8 = h.get("funding_8h", 0)
         g8 = g.get("funding_8h_decimal", 0)
+        # Long HyENA + Short GRVT: income = (-h8) + g8 = g8 - h8
         spread = g8 - h8
         spread_ann = spread * ANNUAL_MULTIPLIER
 
@@ -116,7 +117,7 @@ class Monitor:
             else:
                 hrs = (ts - self.negative_funding_start).total_seconds() / 3600
                 if hrs >= self.config.funding_negative_duration_hours:
-                    self.alerter.warning(f"Funding spread持续为负 {hrs:.1f}h! {spread_ann:.1f}% ann")
+                    self.alerter.warning(f"Funding spread negative for {hrs:.1f}h! {spread_ann:.1f}% ann")
         else:
             self.negative_funding_start = None
 
@@ -141,9 +142,9 @@ class Monitor:
         dev = abs(price - 1.0)
 
         if dev > self.config.usde_depeg_exit:
-            self.alerter.emergency(f"USDe严重脱锚! ${price:.4f} (偏离{dev*100:.2f}% > 1%) 应立即平仓!")
+            self.alerter.emergency(f"USDe severe depeg! ${price:.4f} (deviation {dev*100:.2f}% > 1%) — close positions immediately!")
         elif dev > self.config.usde_depeg_warning:
-            self.alerter.critical(f"USDe脱锚警告: ${price:.4f} (偏离{dev*100:.2f}% > 0.5%)")
+            self.alerter.critical(f"USDe depeg warning: ${price:.4f} (deviation {dev*100:.2f}% > 0.5%)")
 
     # --- Circuit Breaker ---
 
@@ -166,10 +167,10 @@ class Monitor:
 
         move = abs(mid - oldest) / oldest
         if move > self.config.circuit_breaker_pct and not self.circuit_breaker_active:
-            self.alerter.critical(f"Circuit Breaker! BTC 1h波动 {move*100:.1f}% > 15%. 自动化暂停.")
+            self.alerter.critical(f"Circuit Breaker! BTC 1h move {move*100:.1f}% > 15%. Automation paused.")
             self.circuit_breaker_active = True
         elif move <= self.config.circuit_breaker_pct and self.circuit_breaker_active:
-            self.alerter.info("Circuit Breaker解除")
+            self.alerter.info("Circuit Breaker lifted")
             self.circuit_breaker_active = False
 
     # --- Status Report ---
@@ -201,13 +202,13 @@ class Monitor:
             spread_settled = g.get("funding_8h_decimal", 0) - h.get("funding_8h", 0)
             spread_pred = g.get("funding_8h_decimal", 0) - h.get("predicted_8h", 0)
             lines += [
-                f"\n  Rates (已结算 / 预测):",
+                f"\n  Rates (settled / predicted):",
                 f"    HyENA settled: {h.get('funding_8h',0):+.6f}/8h ({h.get('annual_pct',0):+.1f}%)",
                 f"    HyENA predict: {h.get('predicted_8h',0):+.6f}/8h ({h.get('predicted_ann',0):+.1f}%)",
                 f"    GRVT:          {g.get('funding_8h_decimal',0):+.6f}/8h ({g.get('annual_pct',0):+.1f}%)",
                 f"    Spread(settled): {spread_settled * ANNUAL_MULTIPLIER:+.1f}% ann",
                 f"    Spread(predict): {spread_pred * ANNUAL_MULTIPLIER:+.1f}% ann",
-                f"    ⚠ USDe 12% + GRVT 10% 奖励不含在上述费率中",
+                f"    Note: USDe 12% + GRVT 10% rewards are NOT included in the rates above",
             ]
         except Exception:
             pass
