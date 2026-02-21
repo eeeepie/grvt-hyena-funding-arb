@@ -2,7 +2,7 @@
 
 Delta-neutral funding rate arb: **Long HyENA** (`hyna:BTC`) + **Short GRVT** (`BTC_USDT_Perp`).
 
-Core alpha = stacking margin rewards (USDe 12% + GRVT 10% = **22% APR base**), not the funding spread itself.
+Core alpha = stacking margin rewards (USDe 12% + GRVT 10% = **~11% blended APR** on total capital), not the funding spread itself.
 
 | | Reward Basis | Note |
 |--|-------------|------|

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 BTC perpetual funding rate arbitrage system: **Long HyENA** (`hyna:BTC`) + **Short GRVT** (`BTC_USDT_Perp`).
 
-Core alpha = stacking margin rewards (USDe 12% + GRVT equity 10% = 22% base APR), not the funding spread itself.
+Core alpha = stacking margin rewards (USDe 12% + GRVT equity 10% = ~11% blended APR on total capital), not the funding spread itself.
 
 ### Reward Basis
 - **HyENA 12% APR**: basis = `min(USDe balance, long notional)` — leverage multiplies reward; require USDe balance ≥ notional or reward is capped at balance

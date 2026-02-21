@@ -38,8 +38,8 @@
 
 This document defines the requirements for an automated cross-exchange funding rate arbitrage system operating across HyENA (HIP-3 on Hyperliquid) and GRVT. The system executes delta-neutral positions to capture funding rate differentials and margin reward programs while maintaining strict risk controls suitable for retail investors. Backpack is documented as a potential diversification option but is not implemented in v3.1.
 
-- **Target Annual Return:** 20–23% (conservative, risk-adjusted)
-- **Revenue Composition:** ~22% from margin rewards (stable) + ~1.7% from funding spread (variable)
+- **Target Annual Return:** 10–13% (conservative, risk-adjusted)
+- **Revenue Composition:** ~11% from margin rewards (stable, blended on total capital) + ~1.7% from funding spread (variable)
 - **Maximum Capital:** 100,000 USDT
 - **Maximum Leverage:** 2x per leg
 - **Risk Profile:** Market-neutral; primary risks are platform-level (ADL, depeg, haircut)
@@ -64,7 +64,7 @@ The system opens equal-and-opposite (delta-neutral) BTC perpetual positions acro
 | Ethena Points | USDe margin usage | Unquantified | Accumulative |
 | Based Gold | Based ecosystem | Unquantified | Accumulative |
 
-**Core Insight:** The alpha comes from stacking margin rewards across platforms (12% + 10% = 22%), not from funding rate arbitrage. Funding only needs to stay roughly neutral. Even if funding nets to zero, the strategy still yields ~19% from rewards alone.
+**Core Insight:** The alpha comes from stacking margin rewards across platforms. Since capital is split between two exchanges (12% on HyENA side + 10% on GRVT side), the blended reward on total capital is ~11%, not 22%. Funding only needs to stay roughly neutral. Even if funding nets to zero, the strategy still yields ~9.5% from rewards alone (after fees).
 
 ### 2.3 Recommended Position Configuration
 
@@ -271,7 +271,8 @@ Based on 30-day historical data (2026-01-11 to 2026-02-10), 731 hourly HyENA rec
 | USDe Boosted Reward | +12.0% | Fixed (promotional) |
 | GRVT Equity Reward | +10.0% | Fixed (≤10K notional) |
 | Fees + slippage | -2.8% | Estimated |
-| **Net expected** | **~21.5%** | Conservative |
+| **Blended reward on total capital** | **~11%** | Capital split 50/50 |
+| **Net expected** | **~11.9%** | Conservative |
 
 ### 5.4 Directional Reversal Analysis (researched, rejected)
 
@@ -283,11 +284,11 @@ We evaluated auto-reversing direction (Short HyENA + Long GRVT) when spread is n
 | 10% | 3 | -1.0% | Worse (-3.3%) |
 | 20% | 1 | +2.8% | Marginal (+0.5%) |
 
-**Conclusion: Auto-reversal not viable.** Regime switches too frequently (avg 1–2 days), flip cost ~21bps/event (4 trades) accumulates fast, and signal lags the market. USDe + GRVT rewards (+22%) dwarf the funding spread in all scenarios, making direction less important than staying in position.
+**Conclusion: Auto-reversal not viable.** Regime switches too frequently (avg 1–2 days), flip cost ~21bps/event (4 trades) accumulates fast, and signal lags the market. USDe + GRVT rewards (~11% blended on total capital) dwarf the funding spread in all scenarios, making direction less important than staying in position.
 
 ### 5.5 Key Observations
 
-1. **Rewards dominate returns.** The +22% from USDe + GRVT rewards makes the strategy profitable even when funding is -3% net.
+1. **Rewards dominate returns.** The ~11% blended reward on total capital makes the strategy profitable even when funding is -3% net.
 2. **HyENA funding is more volatile** (range 2.9x wider than HL native) due to lower liquidity.
 3. **Feb 2026 shows a structural shift** — HyENA funding turned negative, making Strategy A funding-positive for the first time.
 4. **Fixed direction is optimal.** Stay Long HyENA + Short GRVT; only manually reverse if spread sustains >-20% ann for 1+ weeks.
@@ -317,9 +318,9 @@ Position: HyENA Long + GRVT Short, equal notional (BTC quantity-matched), 2x lev
 
 | Calculation | Value |
 |-------------|-------|
-| Weighted = 90% × 20.9% + 10% × 40% | 22.8% annual |
-| Conservative Estimate (risk-adjusted) | **20–23% annual** |
-| Revenue: Rewards (stable) | ~22% |
+| Weighted = 90% × 10.5% + 10% × 20% | ~11.5% annual |
+| Conservative Estimate (risk-adjusted) | **10–13% annual** |
+| Revenue: Rewards (stable, blended) | ~11% |
 | Revenue: Funding (variable) | ~1.7% (can be negative) |
 
 ### 6.3 Cost Breakdown
