@@ -45,7 +45,7 @@ class HyenaClient:
         self.coin = config.hyena_coin        # "hyna:BTC"
         self.dex = config.hyena_dex          # "hyna"
         self.info_url = config.hl_info_api
-        self.builder = {"b": config.hyena_builder_address, "f": config.hyena_builder_fee}
+        self.builder = None  # Builder fee removed — requires on-chain approval on hyna dex
 
         self._exchange = None
         self._account = None
@@ -79,9 +79,13 @@ class HyenaClient:
 
     def get_book(self) -> dict:
         raw = self._post({"type": "l2Book", "coin": self.coin, "nSigFigs": 5})
+        bids = raw.get("levels", [[]])[0]
+        asks = raw.get("levels", [[], []])[1] if len(raw.get("levels", [])) > 1 else []
+        if not bids or not asks:
+            raise RuntimeError(f"hyna:BTC order book empty (bids={len(bids)}, asks={len(asks)})")
         return book_from_levels(
-            float(raw["levels"][0][0]["px"]),
-            float(raw["levels"][1][0]["px"]),
+            float(bids[0]["px"]),
+            float(asks[0]["px"]),
         )
 
     def get_mid_price(self) -> float:
@@ -211,11 +215,15 @@ class HyenaClient:
         side = "BUY" if is_buy else "SELL"
         logger.info(f"HyENA {side} {size} BTC @ ${price:,.0f} (IOC, reduce={reduce_only})")
 
+        order_kwargs = dict(
+            reduce_only=reduce_only,
+        )
+        if self.builder:
+            order_kwargs["builder"] = self.builder
         result = self._exchange.order(
             self.coin, is_buy, size, price,
             {"limit": {"tif": "Ioc"}},
-            reduce_only=reduce_only,
-            builder=self.builder,
+            **order_kwargs,
         )
         logger.info(f"HyENA result: {result}")
         # Check for API-level errors (SDK returns {'status':'ok'} even on order rejection)
@@ -278,14 +286,29 @@ class HyenaClient:
             logger.error(f"HyENA get_accumulated_funding failed: {e}")
             return 0.0
 
-    def market_close(self, size: float) -> dict:
-        """Close position with aggressive IOC. size>0 = close long, size<0 = close short."""
+    def market_close(self, size: float, max_retries: int = 3) -> dict:
+        """Close position with aggressive IOC. size>0 = close long, size<0 = close short.
+        Retries with fresh book query and increasing price offset on failure."""
         self._require_sdk()
-        book = self.get_book()
-        if size > 0:
-            return self.place_order(False, abs(size), round(book["best_bid"] * 0.995, 0), reduce_only=True)
-        else:
-            return self.place_order(True, abs(size), round(book["best_ask"] * 1.005, 0), reduce_only=True)
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                book = self.get_book()
+                # Escalating offset: 0.5% → 1% → 2%
+                offset = [0.005, 0.01, 0.02][min(attempt, 2)]
+                if size > 0:
+                    px = round(book["best_bid"] * (1 - offset), 0)
+                    result = self.place_order(False, abs(size), px, reduce_only=True)
+                else:
+                    px = round(book["best_ask"] * (1 + offset), 0)
+                    result = self.place_order(True, abs(size), px, reduce_only=True)
+                return result
+            except Exception as e:
+                last_err = e
+                logger.warning(f"HyENA market_close attempt {attempt + 1}/{max_retries} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+        raise RuntimeError(f"HyENA market_close failed after {max_retries} attempts: {last_err}")
 
 
 # ============================================================================

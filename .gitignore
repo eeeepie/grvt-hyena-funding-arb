@@ -6,3 +6,11 @@ __pycache__/
 .DS_Store
 .idea/
 .claude/
+
+# Project docs (local only, not for repo)
+CLAUDE.md
+lessons.md
+CHANGELOG.md
+PRD_Cross_Exchange_Funding_Rate_Arbitrage_v3.md
+Research_Checklist_for_New_Strategy.md
+patterns.md

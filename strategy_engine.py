@@ -539,8 +539,15 @@ class StrategyEngine:
             # ── Reward estimates ──
             h_notional = h_size * h_entry_px if h_entry_px else 0
             g_notional = g_size * g_entry_px if g_entry_px else 0
-            usde_reward = h_notional * (self.config.usde_reward_apr / 100) * (holding_days / 365) if holding_days > 0 else 0
-            grvt_reward = g_notional * (self.config.grvt_reward_apr / 100) * (holding_days / 365) if holding_days > 0 else 0
+            # USDe reward: basis = min(USDe balance, long notional) per docs.hyena.trade/boosted-rewards
+            h_equity_for_reward = self.state.entry_h_balance if has_snapshot else (
+                pre_h_bal.get("account_value", 0) if isinstance(pre_h_bal, dict) else 0)
+            usde_basis = min(h_equity_for_reward, h_notional) if h_equity_for_reward > 0 else h_notional
+            usde_reward = usde_basis * (self.config.usde_reward_apr / 100) * (holding_days / 365) if holding_days > 0 else 0
+            # GRVT reward: basis = account equity (leverage-agnostic)
+            g_equity_for_reward = self.state.entry_g_balance if has_snapshot else (
+                pre_g_bal.get("total_equity", 0) if isinstance(pre_g_bal, dict) else 0)
+            grvt_reward = g_equity_for_reward * (self.config.grvt_reward_apr / 100) * (holding_days / 365) if holding_days > 0 else 0
             reward_total = usde_reward + grvt_reward
 
             # ── APR ──
@@ -843,10 +850,11 @@ class StrategyEngine:
         else:
             self.alerter.info(f"GRVT close: {g_result}")
 
-        # Verify + retry residual (up to 2 retries per leg)
+        # Verify + retry residual (up to 2 retries per leg, with increasing wait
+        # to give hyna:BTC book time to replenish)
         all_closed = False
         for retry in range(3):
-            await asyncio.sleep(2)
+            await asyncio.sleep(3 + retry * 2)  # 3s, 5s, 7s — thin book needs time
             h_pos, g_pos = await self._both(self.hyena.get_position, self.grvt.get_position)
             h_rem = h_pos.get("size", 0) if not isinstance(h_pos, Exception) else 999
             g_rem = g_pos.get("size", 0) if not isinstance(g_pos, Exception) else 999
@@ -878,9 +886,13 @@ class StrategyEngine:
             self.alerter.critical(
                 f"Close incomplete! Residual: HyENA={h_rem:.4f} GRVT={g_rem:.4f} -- manual intervention needed"
             )
+            # Do NOT reset state — preserve entry snapshot for manual retry
+            self.state.state = PositionState.ERROR
+            self.state.pending_trade = False
+            return False
 
         self.state.reset()
-        return all_closed
+        return True
 
     # ── Rebalance ──────────────────────────────────────────────────────────
 
