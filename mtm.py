@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Mark-to-market PnL report — shows current P&L without closing positions."""
+import argparse
 import asyncio
 import time
 import logging
@@ -12,11 +13,15 @@ logging.basicConfig(level=logging.WARNING)
 
 
 async def main():
-    exchange_cfg, strategy_cfg, monitor_cfg = load_config()
+    parser = argparse.ArgumentParser(description="Mark-to-Market PnL Report")
+    parser.add_argument("--asset", default="BTC", choices=["BTC", "HYPE", "SOL"])
+    args = parser.parse_args()
+
+    exchange_cfg, strategy_cfg, monitor_cfg, asset_cfg = load_config(args.asset)
     alerter = Alerter(monitor_cfg.log_dir)
-    hyena = HyenaClient(exchange_cfg)
-    grvt = GrvtClient(exchange_cfg)
-    strategy = StrategyEngine(hyena, grvt, strategy_cfg, monitor_cfg, alerter)
+    hyena = HyenaClient(exchange_cfg, asset_cfg)
+    grvt = GrvtClient(exchange_cfg, asset_cfg)
+    strategy = StrategyEngine(hyena, grvt, strategy_cfg, monitor_cfg, alerter, asset_cfg)
 
     # Load current positions
     h_pos = hyena.get_position()
@@ -24,7 +29,8 @@ async def main():
     h_sz = h_pos.get("size", 0)
     g_sz = g_pos.get("size", 0)
 
-    if abs(h_sz) < 0.001 and abs(g_sz) < 0.001:
+    flat = asset_cfg.flat_threshold
+    if abs(h_sz) < flat and abs(g_sz) < flat:
         print("No positions found, cannot generate report")
         return
 
@@ -71,27 +77,40 @@ async def main():
     h_unrealized = h_pos.get("unrealized_pnl", 0)
     g_unrealized = g_pos.get("unrealized_pnl", 0)
 
+    # Direction (needed for funding sign correction)
+    hyena_is_buy = asset_cfg.hyena_is_buy
+    grvt_is_buy = not hyena_is_buy
+
     # ── Funding ──
     h_funding = 0.0
     if h_size > 0:
         try:
-            h_funding = hyena.get_accumulated_funding(entry_ms, h_size)
+            # Pass signed size: positive = long, negative = short
+            signed_h_size = h_size if hyena_is_buy else -h_size
+            h_funding = hyena.get_accumulated_funding(entry_ms, signed_h_size)
         except Exception as e:
             print(f"  (HyENA funding query failed: {e})")
 
     # GRVT: use funding_payment_history API (precise)
+    # GRVT amounts are from long perspective — pass actual direction
     g_funding = 0.0
     try:
         start_ns = int(entry_time * 1e9)
-        g_funding = grvt.get_funding_payments(start_ns)
+        g_funding = grvt.get_funding_payments(start_ns, is_buy=grvt_is_buy)
     except Exception as e:
         print(f"  (GRVT funding query failed: {e})")
     funding_total = h_funding + g_funding
 
-    # Position PnL from price
+    # Position PnL from price (direction-aware)
     g_bal_now = g_bal.get("total_equity", 0) if isinstance(g_bal, dict) else 0
-    g_pos_pnl = (g_entry_px - g_mid) * g_size if g_entry_px else 0
-    h_pos_pnl = (h_mid - h_entry_px) * h_size if h_entry_px else 0
+    if hyena_is_buy:
+        h_pos_pnl = (h_mid - h_entry_px) * h_size if h_entry_px else 0
+    else:
+        h_pos_pnl = (h_entry_px - h_mid) * h_size if h_entry_px else 0
+    if grvt_is_buy:
+        g_pos_pnl = (g_mid - g_entry_px) * g_size if g_entry_px else 0
+    else:
+        g_pos_pnl = (g_entry_px - g_mid) * g_size if g_entry_px else 0
     pos_total = h_pos_pnl + g_pos_pnl
 
     # ── Fees from entry fills ──
@@ -106,8 +125,11 @@ async def main():
     except Exception:
         pass
 
-    h_entry_fills = [f for f in h_fills if f.get("dir") == "Open Long" or f.get("side") == "B"]
-    # Filter GRVT fills: sell side + after entry time
+    if hyena_is_buy:
+        h_entry_fills = [f for f in h_fills if f.get("dir") == "Open Long" or f.get("side") == "B"]
+    else:
+        h_entry_fills = [f for f in h_fills if f.get("dir") == "Open Short" or f.get("side") == "A"]
+    # Filter GRVT fills: entry side + after entry time
     def _grvt_time_secs(t):
         """Normalize GRVT timestamp (could be ns/ms/s) to seconds."""
         t = int(str(t))
@@ -115,9 +137,14 @@ async def main():
         if t > 1e12: return t / 1e3   # milliseconds
         return t                       # seconds
 
-    g_entry_fills = [f for f in g_fills
-                     if not f.get("is_buyer")
-                     and _grvt_time_secs(f.get("time", 0)) >= entry_time - 60]
+    if grvt_is_buy:
+        g_entry_fills = [f for f in g_fills
+                         if f.get("is_buyer")
+                         and _grvt_time_secs(f.get("time", 0)) >= entry_time - 60]
+    else:
+        g_entry_fills = [f for f in g_fills
+                         if not f.get("is_buyer")
+                         and _grvt_time_secs(f.get("time", 0)) >= entry_time - 60]
     h_entry_fee = sum(f["fee"] for f in h_entry_fills)
     g_entry_fee = sum(f["fee"] for f in g_entry_fills)
     fee_total = h_entry_fee + g_entry_fee
@@ -176,8 +203,10 @@ async def main():
     lines.append(f"  P&L Report (Mark-to-Market)")
     lines.append(f"{'═' * W}")
     lines.append(f"\n  Holding: {hold_str}")
-    lines.append(f"  Position: Long hyna:BTC / Short BTC_USDT_Perp")
-    lines.append(f"  Size: {avg_size:.5f} BTC (approx ${avg_size * h_entry_px:,.0f}/leg)")
+    h_dir = "Long" if hyena_is_buy else "Short"
+    g_dir = "Long" if grvt_is_buy else "Short"
+    lines.append(f"  Position: {h_dir} {asset_cfg.hyena_coin} / {g_dir} {asset_cfg.grvt_instrument}")
+    lines.append(f"  Size: {avg_size:.5f} {asset_cfg.name} (approx ${avg_size * h_entry_px:,.0f}/leg)")
     lines.append(f"  Leverage: HyENA {h_lev:.1f}x / GRVT {g_lev:.1f}x")
 
     # Per-leg totals (matches frontend display)
@@ -187,8 +216,8 @@ async def main():
 
     lines.append(f"\n  -- P&L Attribution --")
     lines.append(f"    Funding Income:          {funding_total:+10.2f}     ({_pct(funding_total):+5.1f}%)")
-    lines.append(f"      HyENA (long):              {h_funding:+.2f}")
-    lines.append(f"      GRVT (short):              {g_funding:+.2f}")
+    lines.append(f"      HyENA ({h_dir.lower()}):              {h_funding:+.2f}")
+    lines.append(f"      GRVT ({g_dir.lower()}):              {g_funding:+.2f}")
 
     lines.append(f"    Position PnL:            {pos_total:+10.2f}     ({_pct(pos_total):+5.1f}%)")
     lines.append(f"      HyENA: ${h_entry_px:,.0f} → ${h_mid:,.0f}    {h_pos_pnl:+.2f}")

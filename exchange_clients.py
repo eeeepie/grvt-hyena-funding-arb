@@ -1,5 +1,6 @@
 """
 Exchange API wrappers for HyENA (Hyperliquid HIP-3) and GRVT.
+Parameterized by AssetConfig for multi-asset support (BTC, HYPE, etc.).
 """
 
 import json
@@ -8,7 +9,7 @@ import random
 import time
 import requests
 from datetime import datetime, timezone, timedelta
-from config import ExchangeConfig
+from config import ExchangeConfig, AssetConfig, BTC_CONFIG
 
 logger = logging.getLogger("exchange")
 
@@ -39,13 +40,19 @@ def book_from_levels(best_bid: float, best_ask: float) -> dict:
 # ============================================================================
 
 class HyenaClient:
-    """HyENA (hyna:BTC on Hyperliquid HIP-3). Market data is public; trading needs SDK."""
+    """HyENA (Hyperliquid HIP-3). Market data is public; trading needs SDK."""
 
-    def __init__(self, config: ExchangeConfig):
-        self.coin = config.hyena_coin        # "hyna:BTC"
+    def __init__(self, config: ExchangeConfig, asset: AssetConfig = None):
+        asset = asset or BTC_CONFIG
+        self.coin = asset.hyena_coin         # "hyna:BTC" or "hyna:HYPE"
+        self.asset_name = asset.name         # "BTC" or "HYPE"
         self.dex = config.hyena_dex          # "hyna"
         self.info_url = config.hl_info_api
         self.builder = None  # Builder fee removed — requires on-chain approval on hyna dex
+
+        # Asset-specific params
+        self._sz_decimals_cfg = asset.hyena_sz_decimals  # 5 for BTC, 2 for HYPE
+        self._tick_decimals = asset.hyena_tick_decimals   # 0 for BTC, 3 for HYPE
 
         self._exchange = None
         self._account = None
@@ -82,7 +89,7 @@ class HyenaClient:
         bids = raw.get("levels", [[]])[0]
         asks = raw.get("levels", [[], []])[1] if len(raw.get("levels", [])) > 1 else []
         if not bids or not asks:
-            raise RuntimeError(f"hyna:BTC order book empty (bids={len(bids)}, asks={len(asks)})")
+            raise RuntimeError(f"{self.coin} order book empty (bids={len(bids)}, asks={len(asks)})")
         return book_from_levels(
             float(bids[0]["px"]),
             float(asks[0]["px"]),
@@ -126,13 +133,19 @@ class HyenaClient:
 
     def get_sz_decimals(self) -> int:
         if self._sz_decimals is None:
-            meta = self._post({"type": "meta", "dex": self.dex})
-            for a in meta.get("universe", []):
-                if a["name"] == "BTC":
-                    self._sz_decimals = a.get("szDecimals", 5)
-                    break
-            else:
-                self._sz_decimals = 5
+            # Try to fetch from API; fall back to configured value
+            try:
+                meta = self._post({"type": "meta", "dex": self.dex})
+                # HyENA universe names include dex prefix: "hyna:BTC", "hyna:HYPE"
+                bare_name = self.coin.split(":")[-1]  # "BTC" or "HYPE"
+                for a in meta.get("universe", []):
+                    if a["name"] == bare_name or a["name"] == self.coin:
+                        self._sz_decimals = a.get("szDecimals", self._sz_decimals_cfg)
+                        break
+                else:
+                    self._sz_decimals = self._sz_decimals_cfg
+            except Exception:
+                self._sz_decimals = self._sz_decimals_cfg
         return self._sz_decimals
 
     # --- Account (needs SDK / private key) ---
@@ -154,7 +167,7 @@ class HyenaClient:
             state = self._get_clearinghouse()
             for pos in state.get("assetPositions", []):
                 p = pos.get("position", {})
-                if p.get("coin", "") in (self.coin, "BTC"):
+                if p.get("coin", "") in (self.coin, self.asset_name):
                     return {
                         "size": safe_float(p.get("szi")),
                         "entry_px": safe_float(p.get("entryPx")),
@@ -211,9 +224,9 @@ class HyenaClient:
     def place_order(self, is_buy: bool, size: float, price: float, reduce_only=False) -> dict:
         self._require_sdk()
         size = round(size, self.get_sz_decimals())
-        price = round(price, 0)  # HyENA BTC tick size = $1
+        price = round(price, self._tick_decimals)
         side = "BUY" if is_buy else "SELL"
-        logger.info(f"HyENA {side} {size} BTC @ ${price:,.0f} (IOC, reduce={reduce_only})")
+        logger.info(f"HyENA {side} {size} {self.asset_name} @ ${price:,.{self._tick_decimals}f} (IOC, reduce={reduce_only})")
 
         order_kwargs = dict(
             reduce_only=reduce_only,
@@ -237,7 +250,7 @@ class HyenaClient:
     # --- Fill History ---
 
     def get_fills(self, start_ms: int) -> list:
-        """Get fills since start_ms for hyna:BTC. Returns [{px, sz, fee, side, time, closedPnl, dir}]."""
+        """Get fills since start_ms. Returns [{px, sz, fee, side, time, closedPnl, dir}]."""
         try:
             raw = self._post({
                 "type": "userFillsByTime",
@@ -246,7 +259,7 @@ class HyenaClient:
             })
             fills = []
             for f in raw:
-                if f.get("coin") == self.coin or f.get("coin") == "BTC":
+                if f.get("coin") == self.coin or f.get("coin") == self.asset_name:
                     fills.append({
                         "px": safe_float(f.get("px")),
                         "sz": safe_float(f.get("sz")),
@@ -265,22 +278,17 @@ class HyenaClient:
     def get_accumulated_funding(self, start_ms: int, size: float) -> float:
         """Get accumulated funding payment from start_ms to now.
         Returns total funding (positive = received, negative = paid).
-        For a long position, funding = -rate * size * mark_price per period."""
+        size must be SIGNED: positive = long, negative = short."""
         try:
             hist = self._post({"type": "fundingHistory", "coin": self.coin, "startTime": start_ms})
             total = 0.0
             for h in hist:
                 rate = safe_float(h.get("fundingRate"))
-                # For longs: pay when rate > 0, receive when rate < 0
-                # funding_payment = -rate * abs(size) * mark_price (approximated by mid)
-                # But fundingHistory doesn't include mark_price, so use a simpler approach:
-                # The actual funding is already settled to the account, we just sum the rates
-                # and multiply by position notional
                 total += rate
             # total is sum of 1h rates; multiply by position value
             mid = self.get_mid_price()
-            # For long: pay positive rates → negative PnL
-            funding_pnl = -total * abs(size) * mid
+            # funding = -rate * size: long (size>0) pays when rate>0, short (size<0) receives
+            funding_pnl = -total * size * mid
             return funding_pnl
         except Exception as e:
             logger.error(f"HyENA get_accumulated_funding failed: {e}")
@@ -297,10 +305,10 @@ class HyenaClient:
                 # Escalating offset: 0.5% → 1% → 2%
                 offset = [0.005, 0.01, 0.02][min(attempt, 2)]
                 if size > 0:
-                    px = round(book["best_bid"] * (1 - offset), 0)
+                    px = round(book["best_bid"] * (1 - offset), self._tick_decimals)
                     result = self.place_order(False, abs(size), px, reduce_only=True)
                 else:
-                    px = round(book["best_ask"] * (1 + offset), 0)
+                    px = round(book["best_ask"] * (1 + offset), self._tick_decimals)
                     result = self.place_order(True, abs(size), px, reduce_only=True)
                 return result
             except Exception as e:
@@ -341,7 +349,7 @@ _ORDER_TYPES = {
 
 
 def _encode_perp_asset(underlying: int, quote: int) -> str:
-    """Encode perpetual asset ID. BTC=5, USDT=3."""
+    """Encode perpetual asset ID for EIP-712 signing."""
     msg = bytearray(3)
     msg[2] = 1  # PERPETUAL
     msg[1] = underlying
@@ -349,18 +357,25 @@ def _encode_perp_asset(underlying: int, quote: int) -> str:
     return f"0x{msg.hex()}"
 
 
-def _btc_usdt_perp_asset() -> str:
-    return _encode_perp_asset(5, 3)  # BTC=5, USDT=3
-
-
 class GrvtClient:
-    """GRVT (BTC_USDT_Perp). Market data is public; trading needs API key + EIP-712 signing."""
+    """GRVT perpetual futures. Market data is public; trading needs API key + EIP-712 signing."""
 
-    def __init__(self, config: ExchangeConfig):
-        self.instrument = config.grvt_instrument
+    def __init__(self, config: ExchangeConfig, asset: AssetConfig = None):
+        asset = asset or BTC_CONFIG
+        self.instrument = asset.grvt_instrument
+        self.asset_name = asset.name
         self.market_url = config.grvt_market_api
         self.auth_url = config.grvt_auth_api
         self.trade_url = config.grvt_trade_api
+
+        # Asset-specific params
+        self._tick_decimals = asset.grvt_tick_decimals  # 1 for BTC, 3 for HYPE
+        self._size_decimals = asset.grvt_size_decimals  # 3 for BTC, 0 for HYPE
+        self._min_size = asset.grvt_min_size            # 0.001 for BTC, 1.0 for HYPE
+        self._underlying_id = asset.grvt_underlying_id  # 5 for BTC, 41 for HYPE
+        self._quote_id = asset.grvt_quote_id            # 3 (USDT)
+        self._funding_hours = asset.grvt_funding_hours  # 8 for BTC, 4 for HYPE
+        self._asset_id_hex = _encode_perp_asset(asset.grvt_underlying_id, asset.grvt_quote_id)
 
         self._session = requests.Session()
         self._session.headers["Content-Type"] = "application/json"
@@ -477,11 +492,22 @@ class GrvtClient:
 
     def get_funding_rate(self) -> dict:
         t = self.get_ticker()
+        # GRVT returns funding_rate_Xh_curr where X depends on instrument
+        # BTC = 8h, HYPE = 4h. The ticker field is always "funding_rate_8h_curr"
+        # for standard or the actual interval rate as a percentage.
         pct = safe_float(t.get("funding_rate_8h_curr", 0))
-        dec = pct / 100  # 0.01% → 0.0001
+        dec = pct / 100  # 0.01% → 0.0001 (this is the per-interval rate)
+        # Normalize to 8h: if funding_hours != 8, scale accordingly
+        # e.g., 4h rate × 2 = 8h equivalent
+        scale = 8 / self._funding_hours
+        dec_8h = dec * scale
         return {
-            "funding_8h_pct": pct, "funding_8h_decimal": dec,
-            "annual_pct": dec * ANNUAL_MULTIPLIER,
+            "funding_interval_hours": self._funding_hours,
+            "funding_raw_pct": pct,
+            "funding_raw_decimal": dec,
+            "funding_8h_pct": pct * scale,
+            "funding_8h_decimal": dec_8h,
+            "annual_pct": dec_8h * ANNUAL_MULTIPLIER,
             "mark_price": safe_float(t.get("mark_price")),
         }
 
@@ -567,8 +593,10 @@ class GrvtClient:
             logger.error(f"GRVT get_fills failed: {e}")
             return []
 
-    def get_funding_payments(self, start_time_ns: int = 0, limit: int = 100) -> float:
-        """Get accumulated funding payments. Returns total amount (positive = received)."""
+    def get_funding_payments(self, start_time_ns: int = 0, limit: int = 100,
+                             is_buy: bool = True) -> float:
+        """Get accumulated funding payments. Returns total (positive = received, negative = paid).
+        GRVT API amounts are from the LONG perspective — must negate for shorts."""
         self._require_auth()
         try:
             payload = {
@@ -580,8 +608,11 @@ class GrvtClient:
                 payload["start_time"] = str(start_time_ns)
             data = self._trade_post("/full/v1/funding_payment_history", payload)
             results = data.get("result", []) if isinstance(data, dict) else []
-            total = sum(safe_float(r.get("amount", 0)) for r in results)
-            logger.info(f"GRVT funding payments: {len(results)} records, total={total:.4f}")
+            raw_total = sum(safe_float(r.get("amount", 0)) for r in results)
+            # API amounts are from long perspective; negate for short positions
+            total = raw_total if is_buy else -raw_total
+            logger.info(f"GRVT funding payments: {len(results)} records, raw={raw_total:+.4f}, "
+                        f"adjusted({'long' if is_buy else 'short'})={total:+.4f}")
             return total
         except Exception as e:
             logger.error(f"GRVT get_funding_payments failed: {e}")
@@ -620,7 +651,7 @@ class GrvtClient:
             "postOnly": False,
             "reduceOnly": reduce_only,
             "legs": [{
-                "assetID": _btc_usdt_perp_asset(),
+                "assetID": self._asset_id_hex,
                 "contractSize": size_int,
                 "limitPrice": price_int,
                 "isBuyingContract": is_buy,
@@ -668,10 +699,10 @@ class GrvtClient:
 
     def place_order(self, is_buy: bool, size: float, price: float, reduce_only=False) -> dict:
         self._require_auth()
-        size = round(size, 3)
-        price = round(price, 1)
+        size = round(size, self._size_decimals)
+        price = round(price, self._tick_decimals)
         side = "BUY" if is_buy else "SELL"
-        logger.info(f"GRVT {side} {size} BTC @ ${price:,.1f} (IOC, reduce={reduce_only})")
+        logger.info(f"GRVT {side} {size} {self.asset_name} @ ${price:,.{self._tick_decimals}f} (IOC, reduce={reduce_only})")
 
         signed_json = self._sign_order(is_buy, size, price, reduce_only=reduce_only)
         result = self._trade_post_raw("/full/v1/create_order", signed_json)
@@ -687,10 +718,10 @@ class GrvtClient:
                 # 1% offset on retry (0.5% first attempt) for more aggressive fill
                 offset = 0.005 if attempt == 0 else 0.01
                 if is_long:
-                    px = round(mid * (1 - offset), 1)
+                    px = round(mid * (1 - offset), self._tick_decimals)
                     result = self.place_order(False, abs(size), px, reduce_only=True)
                 else:
-                    px = round(mid * (1 + offset), 1)
+                    px = round(mid * (1 + offset), self._tick_decimals)
                     result = self.place_order(True, abs(size), px, reduce_only=True)
                 return result
             except Exception as e:

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import requests
 
-from config import MonitorConfig
+from config import MonitorConfig, AssetConfig, BTC_CONFIG
 from exchange_clients import ANNUAL_MULTIPLIER
 
 
@@ -45,15 +45,17 @@ class Alerter:
 # ============================================================================
 
 class Monitor:
-    def __init__(self, hyena_client, grvt_client, config: MonitorConfig, alerter: Alerter):
+    def __init__(self, hyena_client, grvt_client, config: MonitorConfig, alerter: Alerter,
+                 asset: AssetConfig = None):
         self.hyena = hyena_client
         self.grvt = grvt_client
         self.config = config
         self.alerter = alerter
+        self.asset = asset or BTC_CONFIG
         self.data_dir = Path(config.data_dir)
         self.data_dir.mkdir(exist_ok=True)
 
-        self.btc_prices_1h: list[tuple[float, float]] = []
+        self.prices_1h: list[tuple[float, float]] = []
         self.circuit_breaker_active = False
         self.negative_funding_start = None
         self._csv_headers_written: set[str] = set()
@@ -85,12 +87,16 @@ class Monitor:
 
         h8 = h.get("funding_8h", 0)
         g8 = g.get("funding_8h_decimal", 0)
-        # Long HyENA + Short GRVT: income = (-h8) + g8 = g8 - h8
-        spread = g8 - h8
+        # Direction-aware spread
+        if self.asset.hyena_is_buy:
+            spread = g8 - h8  # Long HyENA + Short GRVT
+        else:
+            spread = h8 - g8  # Short HyENA + Long GRVT
         spread_ann = spread * ANNUAL_MULTIPLIER
 
-        # CSV
-        csv_path = self.data_dir / f"funding_{day}.csv"
+        # CSV — asset-specific filename
+        prefix = f"funding_{self.asset.name.lower()}" if self.asset.name != "BTC" else "funding"
+        csv_path = self.data_dir / f"{prefix}_{day}.csv"
         write_header = day not in self._csv_headers_written
         with open(csv_path, "a", newline="") as f:
             w = csv.writer(f)
@@ -155,19 +161,19 @@ class Monitor:
     async def _check_circuit_once(self):
         mid = self.hyena.get_mid_price()
         now = time.time()
-        self.btc_prices_1h.append((now, mid))
-        self.btc_prices_1h = [(t, p) for t, p in self.btc_prices_1h if now - t < 3600]
+        self.prices_1h.append((now, mid))
+        self.prices_1h = [(t, p) for t, p in self.prices_1h if now - t < 3600]
 
-        if len(self.btc_prices_1h) < 2:
+        if len(self.prices_1h) < 2:
             return
 
-        oldest = self.btc_prices_1h[0][1]
+        oldest = self.prices_1h[0][1]
         if oldest <= 0:
             return
 
         move = abs(mid - oldest) / oldest
         if move > self.config.circuit_breaker_pct and not self.circuit_breaker_active:
-            self.alerter.critical(f"Circuit Breaker! BTC 1h move {move*100:.1f}% > 15%. Automation paused.")
+            self.alerter.critical(f"Circuit Breaker! {self.asset.name} 1h move {move*100:.1f}% > 15%. Automation paused.")
             self.circuit_breaker_active = True
         elif move <= self.config.circuit_breaker_pct and self.circuit_breaker_active:
             self.alerter.info("Circuit Breaker lifted")
@@ -178,19 +184,21 @@ class Monitor:
     def print_status(self, hyena_pos: dict, grvt_pos: dict):
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         sep = "=" * 60
+        asset_name = self.asset.name
+        flat_thresh = self.asset.flat_threshold
 
         h_sz = abs(hyena_pos.get("size", 0))
         g_sz = abs(grvt_pos.get("size", 0))
         delta = abs(h_sz - g_sz)
-        delta_str = "MATCHED ✓" if delta < 0.001 else f"MISMATCH ({delta:.4f} BTC)"
+        delta_str = "MATCHED" if delta < flat_thresh else f"MISMATCH ({delta:.4f} {asset_name})"
 
         lines = [
             f"\n{sep}", f"  STATUS — {now}", sep,
-            f"\n  HyENA (hyna:BTC):",
-            f"    Size: {hyena_pos.get('size',0):.4f} BTC | Entry: ${hyena_pos.get('entry_px',0):,.2f}",
+            f"\n  HyENA ({self.asset.hyena_coin}):",
+            f"    Size: {hyena_pos.get('size',0):.4f} {asset_name} | Entry: ${hyena_pos.get('entry_px',0):,.2f}",
             f"    PnL: ${hyena_pos.get('unrealized_pnl',0):,.2f} | Lev: {hyena_pos.get('leverage_value',0):.1f}x",
-            f"\n  GRVT (BTC_USDT_Perp):",
-            f"    Size: {grvt_pos.get('size',0):.4f} BTC | Entry: ${grvt_pos.get('entry_px',0):,.2f}",
+            f"\n  GRVT ({self.asset.grvt_instrument}):",
+            f"    Size: {grvt_pos.get('size',0):.4f} {asset_name} | Entry: ${grvt_pos.get('entry_px',0):,.2f}",
             f"    PnL: ${grvt_pos.get('unrealized_pnl',0):,.2f} | Lev: {grvt_pos.get('leverage_value',0):.1f}x",
             f"\n  Delta: {delta_str}",
         ]
@@ -199,8 +207,13 @@ class Monitor:
         try:
             h = self.hyena.get_funding_rate()
             g = self.grvt.get_funding_rate()
-            spread_settled = g.get("funding_8h_decimal", 0) - h.get("funding_8h", 0)
-            spread_pred = g.get("funding_8h_decimal", 0) - h.get("predicted_8h", 0)
+            # Direction-dependent spread (must match cmd_rates logic)
+            if self.asset.hyena_is_buy:
+                spread_settled = g.get("funding_8h_decimal", 0) - h.get("funding_8h", 0)
+                spread_pred = g.get("funding_8h_decimal", 0) - h.get("predicted_8h", 0)
+            else:
+                spread_settled = h.get("funding_8h", 0) - g.get("funding_8h_decimal", 0)
+                spread_pred = h.get("predicted_8h", 0) - g.get("funding_8h_decimal", 0)
             lines += [
                 f"\n  Rates (settled / predicted):",
                 f"    HyENA settled: {h.get('funding_8h',0):+.6f}/8h ({h.get('annual_pct',0):+.1f}%)",

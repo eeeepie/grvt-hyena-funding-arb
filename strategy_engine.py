@@ -1,6 +1,6 @@
 """
 Strategy Engine: entry, exit, mirror close, rebalance.
-Long HyENA + Short GRVT, delta-neutral.
+Supports both directions (Long/Short HyENA + Short/Long GRVT) via AssetConfig.
 """
 
 import asyncio
@@ -12,9 +12,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from config import StrategyConfig, MonitorConfig
+from config import StrategyConfig, MonitorConfig, AssetConfig, BTC_CONFIG
 
-STATE_FILE = os.path.join(os.path.dirname(__file__), "data", "entry_state.json")
+
+def _state_file(asset_name: str) -> str:
+    """Per-asset state file: data/entry_state.json (BTC) or data/entry_state_HYPE.json."""
+    base = os.path.join(os.path.dirname(__file__), "data")
+    if asset_name == "BTC":
+        return os.path.join(base, "entry_state.json")
+    return os.path.join(base, f"entry_state_{asset_name}.json")
 
 logger = logging.getLogger("strategy")
 
@@ -42,6 +48,7 @@ class LegInfo:
 
 @dataclass
 class StrategyState:
+    asset_name: str = "BTC"
     state: PositionState = PositionState.FLAT
     hyena: LegInfo = field(default_factory=lambda: LegInfo("hyena"))
     grvt: LegInfo = field(default_factory=lambda: LegInfo("grvt"))
@@ -63,6 +70,12 @@ class StrategyState:
     entry_g_mid: float = 0.0
     entry_h_fills: list = field(default_factory=list)
     entry_g_fills: list = field(default_factory=list)
+    # Flat detection threshold (set from AssetConfig)
+    flat_threshold: float = 0.001
+
+    @property
+    def _state_file(self) -> str:
+        return _state_file(self.asset_name)
 
     def reset(self):
         """Reset to flat — called after close or mirror close."""
@@ -83,7 +96,9 @@ class StrategyState:
 
     def save_entry_state(self):
         """Persist entry snapshot to disk for cross-process PnL reporting."""
+        sf = self._state_file
         data = {
+            "asset": self.asset_name,
             "entry_time": self.entry_time,
             "entry_h_balance": self.entry_h_balance,
             "entry_h_perps_margin": self.entry_h_perps_margin,
@@ -97,17 +112,18 @@ class StrategyState:
             "h_entry_px": self.hyena.entry_px,
             "g_entry_px": self.grvt.entry_px,
         }
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(STATE_FILE, "w") as f:
+        os.makedirs(os.path.dirname(sf), exist_ok=True)
+        with open(sf, "w") as f:
             json.dump(data, f, indent=2)
-        logger.info(f"Entry state saved to {STATE_FILE}")
+        logger.info(f"Entry state saved to {sf}")
 
     def load_entry_state(self) -> bool:
         """Load entry snapshot from disk. Returns True if loaded."""
-        if not os.path.exists(STATE_FILE):
+        sf = self._state_file
+        if not os.path.exists(sf):
             return False
         try:
-            with open(STATE_FILE) as f:
+            with open(sf) as f:
                 data = json.load(f)
             self.entry_time = data["entry_time"]
             self.entry_h_balance = data["entry_h_balance"]
@@ -117,17 +133,17 @@ class StrategyState:
             self.entry_g_mid = data["entry_g_mid"]
             self.entry_h_fills = data.get("entry_h_fills", [])
             self.entry_g_fills = data.get("entry_g_fills", [])
-            logger.info(f"Entry state loaded from {STATE_FILE}")
+            logger.info(f"Entry state loaded from {sf}")
             return True
         except Exception as e:
             logger.warning(f"Failed to load entry state: {e}")
             return False
 
-    @staticmethod
-    def clear_entry_state():
+    def clear_entry_state(self):
         """Remove entry state file after close."""
-        if os.path.exists(STATE_FILE):
-            os.remove(STATE_FILE)
+        sf = self._state_file
+        if os.path.exists(sf):
+            os.remove(sf)
 
     def load_from_exchange(self, h_pos: dict, g_pos: dict):
         """Sync state from live exchange positions."""
@@ -135,7 +151,7 @@ class StrategyState:
             leg.size = pos.get("size", 0)
             leg.last_known_size = leg.size
             leg.entry_px = pos.get("entry_px", 0)
-        if abs(self.hyena.size) > 0.001 or abs(self.grvt.size) > 0.001:
+        if abs(self.hyena.size) > self.flat_threshold or abs(self.grvt.size) > self.flat_threshold:
             self.state = PositionState.OPEN
 
 
@@ -145,14 +161,23 @@ class StrategyState:
 
 class StrategyEngine:
     def __init__(self, hyena_client, grvt_client,
-                 config: StrategyConfig, mon_config: MonitorConfig, alerter):
+                 config: StrategyConfig, mon_config: MonitorConfig, alerter,
+                 asset: AssetConfig = None):
         self.hyena = hyena_client
         self.grvt = grvt_client
         self.config = config
         self.mon_config = mon_config
         self.alerter = alerter
-        self.state = StrategyState()
+        self.asset = asset or BTC_CONFIG
+        self.state = StrategyState(
+            asset_name=self.asset.name,
+            flat_threshold=self.asset.flat_threshold,
+        )
         self._poll_fails = {"hyena": 0, "grvt": 0}
+
+        # Direction from config: True = HyENA buys, False = HyENA sells
+        self._hyena_is_buy = self.asset.hyena_is_buy
+        self._grvt_is_buy = not self.asset.hyena_is_buy  # opposite side
 
     # --- Helpers ---
 
@@ -209,18 +234,18 @@ class StrategyEngine:
             f"GRVT mid=${g_book['mid']:,.1f} ({g_book['spread_bps']:.1f}bps)"
         )
 
-        # 2b. Compute BTC quantity from USD amount
-        qty = round(usd_per_leg / avg_mid, self.config.quantity_precision)
+        # 2b. Compute quantity from USD amount
+        qty = round(usd_per_leg / avg_mid, self.asset.quantity_precision)
         # Enforce GRVT minimums
-        if qty < 0.001:
-            self.alerter.critical(f"Quantity {qty} BTC < GRVT minimum 0.001")
+        if qty < self.asset.grvt_min_size:
+            self.alerter.critical(f"Quantity {qty} {self.asset.name} < GRVT minimum {self.asset.grvt_min_size}")
             self.state.state = PositionState.FLAT
             return False
-        if qty * avg_mid < 100:
-            self.alerter.critical(f"Notional ${qty * avg_mid:.2f} < GRVT minimum $100")
+        if qty * avg_mid < self.asset.grvt_min_notional:
+            self.alerter.critical(f"Notional ${qty * avg_mid:.2f} < GRVT minimum ${self.asset.grvt_min_notional}")
             self.state.state = PositionState.FLAT
             return False
-        self.alerter.info(f"  Entry qty: {qty} BTC (approx ${qty * avg_mid:,.2f}/leg)")
+        self.alerter.info(f"  Entry qty: {qty} {self.asset.name} (approx ${qty * avg_mid:,.2f}/leg)")
 
         # 2c. Leverage guard
         notional = qty * avg_mid
@@ -250,20 +275,34 @@ class StrategyEngine:
                     self.alerter.warning(f"Order book fetch failed, continuing retry...")
                     continue
 
-            # Price offset: 5bps first try, 10bps on retry (hyna:BTC book can be thin)
-            offset_bps = self.config.aggressive_limit_offset_bps if attempt == 0 else (self.config.aggressive_limit_offset_bps * 2)
+            # Price offset: base bps first try, double on retry (thin book)
+            offset_bps = self.asset.aggressive_limit_offset_bps if attempt == 0 else (self.asset.aggressive_limit_offset_bps * 2)
             offset = offset_bps / 10000
-            buy_px = round(h_book["mid"] * (1 + offset), 0)   # HyENA tick = $1
-            sell_px = round(g_book["mid"] * (1 - offset), 1)   # GRVT tick = $0.1
 
+            # Direction-aware pricing
+            h_is_buy = self._hyena_is_buy
+            g_is_buy = self._grvt_is_buy
+            h_td = self.asset.hyena_tick_decimals
+            g_td = self.asset.grvt_tick_decimals
+            if h_is_buy:
+                h_px = round(h_book["mid"] * (1 + offset), h_td)
+            else:
+                h_px = round(h_book["mid"] * (1 - offset), h_td)
+            if g_is_buy:
+                g_px = round(g_book["mid"] * (1 + offset), g_td)
+            else:
+                g_px = round(g_book["mid"] * (1 - offset), g_td)
+
+            h_side = "BUY" if h_is_buy else "SELL"
+            g_side = "BUY" if g_is_buy else "SELL"
             self.alerter.info(
                 f"Submitting orders{f' (retry {attempt})' if attempt else ''}: "
-                f"HyENA BUY {qty}@${buy_px:,.0f} | GRVT SELL {qty}@${sell_px:,.1f}"
+                f"HyENA {h_side} {qty}@${h_px:,.{h_td}f} | GRVT {g_side} {qty}@${g_px:,.{g_td}f}"
             )
 
             h_res, g_res = await self._both(
-                lambda: self.hyena.place_order(True, qty, buy_px),
-                lambda: self.grvt.place_order(False, qty, sell_px),
+                lambda: self.hyena.place_order(h_is_buy, qty, h_px),
+                lambda: self.grvt.place_order(g_is_buy, qty, g_px),
             )
 
             h_ok = not isinstance(h_res, Exception)
@@ -292,8 +331,8 @@ class StrategyEngine:
                 await self._print_entry_costs(entry_ms, h_book["mid"], g_book["mid"])
                 self.state.save_entry_state()
 
-                if abs(abs(self.state.hyena.size) - abs(self.state.grvt.size)) > self.config.qty_mismatch_threshold:
-                    self.alerter.warning("BTC quantity mismatch!")
+                if abs(abs(self.state.hyena.size) - abs(self.state.grvt.size)) > self.asset.qty_mismatch_threshold:
+                    self.alerter.warning(f"{self.asset.name} quantity mismatch!")
                 return True
 
             # One side failed — if it's a retryable IOC rejection on HyENA, and GRVT
@@ -302,8 +341,10 @@ class StrategyEngine:
 
             if h_ok and not g_ok:
                 self.alerter.emergency(f"GRVT failed! {g_res}. Closing HyENA...")
+                # Close HyENA: if we bought, size is positive (close long); if sold, negative
+                h_close_sz = qty if h_is_buy else -qty
                 try:
-                    await asyncio.to_thread(self.hyena.market_close, qty)
+                    await asyncio.to_thread(self.hyena.market_close, h_close_sz)
                 except Exception as e:
                     self.alerter.emergency(f"HyENA close also failed: {e}")
                 break  # Don't retry — one side was filled + unwound
@@ -314,7 +355,7 @@ class StrategyEngine:
                 if g_filled:
                     self.alerter.emergency(f"HyENA failed! {h_res}. GRVT filled, closing GRVT...")
                     try:
-                        await asyncio.to_thread(self.grvt.market_close, qty, False)
+                        await asyncio.to_thread(self.grvt.market_close, qty, g_is_buy)
                     except Exception as e:
                         self.alerter.emergency(f"GRVT close also failed: {e}")
                     break  # Don't retry — GRVT was filled + unwound
@@ -382,13 +423,18 @@ class StrategyEngine:
             self.state.entry_h_fills = h_fills
             self.state.entry_g_fills = g_fills
 
+            h_side = "BUY" if self._hyena_is_buy else "SELL"
+            g_side = "BUY" if self._grvt_is_buy else "SELL"
+            h_td = self.asset.hyena_tick_decimals
+            g_td = self.asset.grvt_tick_decimals
+
             lines = ["\n-- Entry Costs --"]
             total_fee = 0.0
 
             if h_fills:
                 f = h_fills[0]
                 slip_bps = abs(f["px"] - h_mid) / h_mid * 10000 if h_mid else 0
-                lines.append(f"  HyENA BUY:  fill ${f['px']:,.0f} | mid ${h_mid:,.0f} → slippage {slip_bps:.1f}bps | fee ${f['fee']:.4f}")
+                lines.append(f"  HyENA {h_side}:  fill ${f['px']:,.{h_td}f} | mid ${h_mid:,.{h_td}f} → slippage {slip_bps:.1f}bps | fee ${f['fee']:.4f}")
                 total_fee += f["fee"]
             else:
                 lines.append("  HyENA: no fill records found")
@@ -397,7 +443,7 @@ class StrategyEngine:
                 f = g_fills[0]
                 slip_bps = abs(f["px"] - g_mid) / g_mid * 10000 if g_mid else 0
                 fee_pct = f["fee_rate"] if f["fee_rate"] else (f["fee"] / (f["px"] * f["sz"]) * 100 if f["px"] * f["sz"] > 0 else 0)
-                lines.append(f"  GRVT SELL:  fill ${f['px']:,.1f} | mid ${g_mid:,.1f} → slippage {slip_bps:.1f}bps | fee ${f['fee']:.4f} ({fee_pct:.3f}%)")
+                lines.append(f"  GRVT {g_side}:  fill ${f['px']:,.{g_td}f} | mid ${g_mid:,.{g_td}f} → slippage {slip_bps:.1f}bps | fee ${f['fee']:.4f} ({fee_pct:.3f}%)")
                 total_fee += f["fee"]
             else:
                 lines.append("  GRVT: no fill records found")
@@ -435,18 +481,37 @@ class StrategyEngine:
             if isinstance(g_fills, Exception):
                 g_fills = []
 
-            h_exit_fills = [f for f in h_fills if f.get("dir") == "Close Long" or f.get("side") == "A"]
+            # Direction-aware fill filtering
+            h_is_buy = self._hyena_is_buy
+            g_is_buy = self._grvt_is_buy
+            if h_is_buy:
+                # HyENA was long → exit = Close Long / side A (sell)
+                h_exit_fills = [f for f in h_fills if f.get("dir") == "Close Long" or f.get("side") == "A"]
+            else:
+                # HyENA was short → exit = Close Short / side B (buy)
+                h_exit_fills = [f for f in h_fills if f.get("dir") == "Close Short" or f.get("side") == "B"]
             # Filter GRVT fills by time
             entry_secs = entry_ms / 1000
             g_fills = [f for f in g_fills if self._grvt_time_secs(f.get("time", 0)) >= entry_secs - 60]
-            g_exit_fills = [f for f in g_fills if f.get("is_buyer")]
+            if g_is_buy:
+                # GRVT was long → exit = sell (is_buyer=False)
+                g_exit_fills = [f for f in g_fills if not f.get("is_buyer")]
+            else:
+                # GRVT was short → exit = buy (is_buyer=True)
+                g_exit_fills = [f for f in g_fills if f.get("is_buyer")]
 
             if has_snapshot and self.state.entry_h_fills:
-                h_entry_fills = [f for f in self.state.entry_h_fills if f.get("dir") == "Open Long" or f.get("side") == "B"]
+                if h_is_buy:
+                    h_entry_fills = [f for f in self.state.entry_h_fills if f.get("dir") == "Open Long" or f.get("side") == "B"]
+                else:
+                    h_entry_fills = [f for f in self.state.entry_h_fills if f.get("dir") == "Open Short" or f.get("side") == "A"]
             else:
                 h_entry_fills = []
             if has_snapshot and self.state.entry_g_fills:
-                g_entry_fills = [f for f in self.state.entry_g_fills if not f.get("is_buyer")]
+                if g_is_buy:
+                    g_entry_fills = [f for f in self.state.entry_g_fills if f.get("is_buyer")]
+                else:
+                    g_entry_fills = [f for f in self.state.entry_g_fills if not f.get("is_buyer")]
             else:
                 g_entry_fills = []
 
@@ -471,17 +536,25 @@ class StrategyEngine:
                 abs(pre_g_pos.get("size", 0)) if pre_g_pos else 0)
             avg_size = (h_size + g_size) / 2
 
-            # ── Position PnL ──
-            h_pos_pnl = (h_exit_px - h_entry_px) * h_size if h_exit_px and h_entry_px else 0
-            g_pos_pnl = (g_entry_px - g_exit_px) * g_size if g_exit_px and g_entry_px else 0
+            # ── Position PnL (direction-aware) ──
+            if h_is_buy:
+                h_pos_pnl = (h_exit_px - h_entry_px) * h_size if h_exit_px and h_entry_px else 0
+            else:
+                h_pos_pnl = (h_entry_px - h_exit_px) * h_size if h_exit_px and h_entry_px else 0
+            if g_is_buy:
+                g_pos_pnl = (g_exit_px - g_entry_px) * g_size if g_exit_px and g_entry_px else 0
+            else:
+                g_pos_pnl = (g_entry_px - g_exit_px) * g_size if g_exit_px and g_entry_px else 0
             pos_total = h_pos_pnl + g_pos_pnl
 
             # ── Funding PnL ──
+            # get_accumulated_funding expects the signed size (positive=long, negative=short)
             h_funding = 0.0
             if h_size > 0:
+                signed_h_size = h_size if h_is_buy else -h_size
                 try:
                     h_funding = await asyncio.to_thread(
-                        self.hyena.get_accumulated_funding, entry_ms, h_size
+                        self.hyena.get_accumulated_funding, entry_ms, signed_h_size
                     )
                 except Exception:
                     pass
@@ -490,7 +563,7 @@ class StrategyEngine:
             try:
                 start_ns = int(self.state.entry_time * 1e9) if has_snapshot else int((time.time() - 86400 * 30) * 1e9)
                 g_funding = await asyncio.to_thread(
-                    self.grvt.get_funding_payments, start_ns
+                    self.grvt.get_funding_payments, start_ns, 100, g_is_buy
                 )
             except Exception:
                 pass
@@ -586,8 +659,11 @@ class StrategyEngine:
                 lines.append(f"\n  Holding: {hold_str}")
 
             # Position summary
-            lines.append(f"  Position: Long hyna:BTC / Short BTC_USDT_Perp")
-            lines.append(f"  Size: {avg_size:.5f} BTC (approx ${avg_size * (h_entry_px or g_entry_px):,.0f}/leg)")
+            h_dir = "Long" if h_is_buy else "Short"
+            g_dir = "Long" if g_is_buy else "Short"
+            lines.append(f"  Position: {h_dir} {self.asset.hyena_coin} / {g_dir} {self.asset.grvt_instrument}")
+            sz_fmt = f".{self.asset.hyena_sz_decimals}f"
+            lines.append(f"  Size: {avg_size:{sz_fmt}} {self.asset.name} (approx ${avg_size * (h_entry_px or g_entry_px):,.0f}/leg)")
             if h_lev > 0 or g_lev > 0:
                 lines.append(f"  Leverage: HyENA {h_lev:.1f}x / GRVT {g_lev:.1f}x")
 
@@ -595,8 +671,8 @@ class StrategyEngine:
             lines.append(f"\n  -- PnL Attribution --")
 
             lines.append(f"    Funding Income:          {funding_total:+10.2f}     ({_pct(funding_total):+5.1f}%)")
-            lines.append(f"      HyENA (long):              {h_funding:+.2f}")
-            lines.append(f"      GRVT (short):              {g_funding:+.2f}")
+            lines.append(f"      HyENA ({h_dir.lower()}):              {h_funding:+.2f}")
+            lines.append(f"      GRVT ({g_dir.lower()}):              {g_funding:+.2f}")
 
             lines.append(f"    Position PnL:            {pos_total:+10.2f}     ({_pct(pos_total):+5.1f}%)")
             if h_entry_px and h_exit_px:
@@ -775,7 +851,8 @@ class StrategyEngine:
         h_sz = h_pos.get("size", 0) if isinstance(h_pos, dict) else 0
         g_sz = g_pos.get("size", 0) if isinstance(g_pos, dict) else 0
 
-        if abs(h_sz) < 0.001 and abs(g_sz) < 0.001:
+        flat = self.state.flat_threshold
+        if abs(h_sz) < flat and abs(g_sz) < flat:
             self.alerter.emergency("Both legs already flat, emergency close complete")
             self.state.reset()
             return
@@ -786,8 +863,8 @@ class StrategyEngine:
         h_ok, g_ok = True, True
         try:
             results = await self._both(
-                lambda: self.hyena.market_close(h_sz) if abs(h_sz) >= 0.001 else "no_pos",
-                lambda: self.grvt.market_close(abs(g_sz), g_sz > 0) if abs(g_sz) >= 0.001 else "no_pos",
+                lambda: self.hyena.market_close(h_sz) if abs(h_sz) >= flat else "no_pos",
+                lambda: self.grvt.market_close(abs(g_sz), g_sz > 0) if abs(g_sz) >= flat else "no_pos",
             )
             h_result, g_result = results
             if isinstance(h_result, Exception):
@@ -825,19 +902,20 @@ class StrategyEngine:
         self.state.pending_trade = True
 
         # Re-query live positions to avoid closing already-flat legs
+        flat = self.state.flat_threshold
         h_pos, g_pos = await self._both(self.hyena.get_position, self.grvt.get_position)
         h_sz = h_pos.get("size", 0) if isinstance(h_pos, dict) else self.state.hyena.size
         g_sz = g_pos.get("size", 0) if isinstance(g_pos, dict) else self.state.grvt.size
 
-        if abs(h_sz) < 0.001 and abs(g_sz) < 0.001:
+        if abs(h_sz) < flat and abs(g_sz) < flat:
             self.alerter.info("Both sides already flat, no close needed")
             self.state.reset()
             return True
 
         self.alerter.info(f"Closing concurrently: HyENA={h_sz:+.4f} GRVT={g_sz:+.4f}")
         results = await self._both(
-            lambda: self.hyena.market_close(h_sz) if abs(h_sz) >= 0.001 else None,
-            lambda: self.grvt.market_close(abs(g_sz), g_sz > 0) if abs(g_sz) >= 0.001 else None,
+            lambda: self.hyena.market_close(h_sz) if abs(h_sz) >= flat else None,
+            lambda: self.grvt.market_close(abs(g_sz), g_sz > 0) if abs(g_sz) >= flat else None,
         )
 
         h_result, g_result = results
@@ -859,7 +937,7 @@ class StrategyEngine:
             h_rem = h_pos.get("size", 0) if not isinstance(h_pos, Exception) else 999
             g_rem = g_pos.get("size", 0) if not isinstance(g_pos, Exception) else 999
 
-            if abs(h_rem) < 0.001 and abs(g_rem) < 0.001:
+            if abs(h_rem) < flat and abs(g_rem) < flat:
                 self.alerter.info("Both sides fully closed")
                 all_closed = True
                 break
@@ -867,13 +945,13 @@ class StrategyEngine:
             if retry < 2:
                 self.alerter.warning(f"Residual position (retry {retry + 1}/2): HyENA={h_rem:.4f} GRVT={g_rem:.4f}")
                 # Retry only the failed leg(s) sequentially
-                if abs(h_rem) >= 0.001:
+                if abs(h_rem) >= flat:
                     try:
                         r = await asyncio.to_thread(self.hyena.market_close, h_rem)
                         self.alerter.info(f"HyENA retry: {r}")
                     except Exception as e:
                         self.alerter.warning(f"HyENA retry failed: {e}")
-                if abs(g_rem) >= 0.001:
+                if abs(g_rem) >= flat:
                     try:
                         r = await asyncio.to_thread(
                             self.grvt.market_close, abs(g_rem), g_rem > 0

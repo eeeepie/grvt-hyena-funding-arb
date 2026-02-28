@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-BTC Funding Rate Arbitrage — Main Entry Point
-==============================================
-    python3 main.py status    # connectivity + positions
-    python3 main.py rates     # current funding rates & yield estimate
-    python3 main.py entry     # open positions + start monitoring
-    python3 main.py monitor   # monitor (positions already open)
-    python3 main.py exit      # close all positions
+Funding Rate Arbitrage — Main Entry Point
+==========================================
+    python3 main.py status                # BTC (default)
+    python3 main.py --asset HYPE status   # HYPE
+    python3 main.py --asset HYPE entry    # open HYPE positions
+
+Modes: status / rates / entry / exit / monitor
 """
 
 import argparse
@@ -15,37 +15,40 @@ import logging
 import sys
 from datetime import datetime, timezone
 
-from config import load_config
+from config import load_config, AssetConfig
 from exchange_clients import HyenaClient, GrvtClient, ANNUAL_MULTIPLIER
 from strategy_engine import StrategyEngine
 from monitor import Monitor, Alerter
 
 
-def setup():
-    """Load config, create all objects. Returns (hyena, grvt, strategy, monitor, alerter)."""
+def setup(asset_name: str = "BTC"):
+    """Load config, create all objects. Returns (hyena, grvt, strategy, monitor, alerter, asset_cfg)."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
 
+    exchange_cfg, strategy_cfg, monitor_cfg, asset_cfg = load_config(asset_name)
+
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    h_dir = "Long" if asset_cfg.hyena_is_buy else "Short"
+    g_dir = "Long" if not asset_cfg.hyena_is_buy else "Short"
     print(f"\n{'='*64}")
-    print(f"  BTC FUNDING RATE ARBITRAGE  |  {now}")
-    print(f"  Long HyENA (hyna:BTC) + Short GRVT (BTC_USDT_Perp)")
+    print(f"  {asset_cfg.name} FUNDING RATE ARBITRAGE  |  {now}")
+    print(f"  {h_dir} HyENA ({asset_cfg.hyena_coin}) + {g_dir} GRVT ({asset_cfg.grvt_instrument})")
     print(f"{'='*64}\n")
 
-    exchange_cfg, strategy_cfg, monitor_cfg = load_config()
     alerter = Alerter(monitor_cfg.log_dir)
 
     alerter.info("Initializing exchange clients...")
-    hyena = HyenaClient(exchange_cfg)
-    grvt = GrvtClient(exchange_cfg)
-    monitor = Monitor(hyena, grvt, monitor_cfg, alerter)
-    strategy = StrategyEngine(hyena, grvt, strategy_cfg, monitor_cfg, alerter)
+    hyena = HyenaClient(exchange_cfg, asset_cfg)
+    grvt = GrvtClient(exchange_cfg, asset_cfg)
+    monitor = Monitor(hyena, grvt, monitor_cfg, alerter, asset_cfg)
+    strategy = StrategyEngine(hyena, grvt, strategy_cfg, monitor_cfg, alerter, asset_cfg)
 
-    return hyena, grvt, strategy, monitor, alerter
+    return hyena, grvt, strategy, monitor, alerter, asset_cfg
 
 
 # ── Commands ───────────────────────────────────────────────────────────
 
-async def cmd_status(hyena, grvt, monitor, strategy_config=None):
+async def cmd_status(hyena, grvt, monitor, strategy_config=None, asset_cfg=None):
     h_mid = g_mid = 0
     print("--- Connectivity ---")
     for name, fn in [("HyENA", hyena.get_mid_price), ("GRVT", grvt.get_mid_price)]:
@@ -69,6 +72,7 @@ async def cmd_status(hyena, grvt, monitor, strategy_config=None):
             print(f"  {name}: {e}")
 
     # Max position estimate
+    asset_name = asset_cfg.name if asset_cfg else "BTC"
     avg_mid = (h_mid + g_mid) / 2 if h_mid and g_mid else 0
     if avg_mid > 0 and h_bal and g_bal:
         max_lev = strategy_config.max_leverage if strategy_config else 3.0
@@ -76,11 +80,12 @@ async def cmd_status(hyena, grvt, monitor, strategy_config=None):
         g_equity = g_bal.get("total_equity", 0)
         min_equity = min(h_equity, g_equity)
         max_notional = min_equity * max_lev
-        max_btc = max_notional / avg_mid
+        max_qty = max_notional / avg_mid
+        sz_dec = asset_cfg.hyena_sz_decimals if asset_cfg else 5
         print(f"\n--- Max Position ({max_lev:.0f}x leverage) ---")
         print(f"  Bottleneck: {'HyENA' if h_equity <= g_equity else 'GRVT'} (${min_equity:,.2f})")
         print(f"  Max Notional: ${max_notional:,.2f}")
-        print(f"  Max BTC:      {max_btc:.5f} BTC (approx ${max_btc * avg_mid:,.2f})")
+        print(f"  Max {asset_name}:      {max_qty:.{sz_dec}f} {asset_name} (approx ${max_qty * avg_mid:,.2f})")
 
     # GRVT leverage
     g_lev = grvt.get_leverage()
@@ -92,17 +97,26 @@ async def cmd_status(hyena, grvt, monitor, strategy_config=None):
     monitor.print_status(hyena.get_position(), grvt.get_position())
 
 
-async def cmd_rates(hyena, grvt):
+async def cmd_rates(hyena, grvt, asset_cfg=None):
     h = hyena.get_funding_rate()
     g = grvt.get_funding_rate()
 
-    # Spread for strategy: Long HyENA + Short GRVT (both standard convention)
+    hyena_is_buy = asset_cfg.hyena_is_buy if asset_cfg else True
+    h_dir = "Long" if hyena_is_buy else "Short"
+    g_dir = "Short" if hyena_is_buy else "Long"
+    grvt_fh = g.get("funding_interval_hours", 8)
+
+    # Spread for strategy: direction-dependent
     # positive rate = longs pay shorts
-    # Long HyENA income = -h_rate, Short GRVT income = +g_rate
-    # Net spread = g_rate - h_rate
-    spread_settled = g["funding_8h_decimal"] - h["funding_8h"]
+    # If HyENA is buy (long): income = -h_rate + g_rate
+    # If HyENA is sell (short): income = +h_rate - g_rate
+    if hyena_is_buy:
+        spread_settled = g["funding_8h_decimal"] - h["funding_8h"]
+        spread_pred = g["funding_8h_decimal"] - h.get("predicted_8h", h["funding_8h"])
+    else:
+        spread_settled = h["funding_8h"] - g["funding_8h_decimal"]
+        spread_pred = h.get("predicted_8h", h["funding_8h"]) - g["funding_8h_decimal"]
     spread_settled_ann = spread_settled * ANNUAL_MULTIPLIER
-    spread_pred = g["funding_8h_decimal"] - h.get("predicted_8h", h["funding_8h"])
     spread_pred_ann = spread_pred * ANNUAL_MULTIPLIER
 
     ts = h.get("timestamp")
@@ -110,28 +124,35 @@ async def cmd_rates(hyena, grvt):
 
     print(f"  HyENA Settled:   {h['funding_8h']:+.6f}/8h  {h['annual_pct']:+.2f}% ann{ts_str}")
     print(f"  HyENA Predicted: {h.get('predicted_8h',0):+.6f}/8h  {h.get('predicted_ann',0):+.2f}% ann")
-    print(f"  GRVT:          {g['funding_8h_decimal']:+.6f}/8h  {g['annual_pct']:+.2f}% ann")
-    print(f"  Net Spread (Long H + Short G):")
+    print(f"  GRVT ({grvt_fh}h→8h): {g['funding_8h_decimal']:+.6f}/8h  {g['annual_pct']:+.2f}% ann")
+    print(f"  Net Spread ({h_dir} H + {g_dir} G):")
     print(f"    settled: {spread_settled:+.6f}/8h  {spread_settled_ann:+.2f}% ann")
     print(f"    predict: {spread_pred:+.6f}/8h  {spread_pred_ann:+.2f}% ann")
 
     # Yield estimate — predicted rate is more indicative
     h_pred_ann = h.get("predicted_ann", h["annual_pct"])
-    h_long = -h_pred_ann          # long pays when rate positive
-    g_short = g["annual_pct"]     # short receives when rate positive (standard)
+    if hyena_is_buy:
+        h_funding = -h_pred_ann     # long pays when rate positive
+        g_funding = g["annual_pct"]  # short receives when rate positive
+    else:
+        h_funding = h_pred_ann      # short receives when rate positive
+        g_funding = -g["annual_pct"] # long pays when rate positive
     usde, equity = 12.0, 10.0
-    net = h_long + g_short + usde + equity
+    net = h_funding + g_funding + usde + equity
 
     print(f"\n  Yield Estimate (based on predicted rate):")
-    print(f"    HyENA Long Funding: {h_long:+.1f}% (predicted)")
-    print(f"    GRVT Short Funding: {g_short:+.1f}%")
+    print(f"    HyENA {h_dir} Funding: {h_funding:+.1f}% (predicted)")
+    print(f"    GRVT {g_dir} Funding: {g_funding:+.1f}%")
     print(f"    USDe Reward:        +{usde:.0f}% (off-chain reward, not in API rate)")
     print(f"    GRVT Equity:        +{equity:.0f}% (off-chain reward)")
+    if asset_cfg and asset_cfg.name != "BTC":
+        print(f"    GRVT 5x Points:     (altcoin multiplier)")
     print(f"    ─────────────────────")
     print(f"    Est. Net Yield:      {net:+.1f}% ann")
 
 
-async def cmd_entry(strategy, monitor, alerter):
+async def cmd_entry(strategy, monitor, alerter, asset_cfg=None):
+    min_notional = asset_cfg.grvt_min_notional if asset_cfg else 100.0
     # Interactive input for position parameters
     print("── Entry Parameters ──\n")
     try:
@@ -144,8 +165,8 @@ async def cmd_entry(strategy, monitor, alerter):
         alerter.critical("Invalid input, aborting entry")
         return
 
-    if usd_per_leg < 100:
-        alerter.critical(f"Amount ${usd_per_leg} below GRVT min notional $100")
+    if usd_per_leg < min_notional:
+        alerter.critical(f"Amount ${usd_per_leg} below GRVT min notional ${min_notional}")
         return
     if max_leverage < 1 or max_leverage > 10:
         alerter.critical(f"Leverage {max_leverage}x out of valid range [1, 10]")
@@ -155,7 +176,8 @@ async def cmd_entry(strategy, monitor, alerter):
     g_lev = strategy.grvt.get_leverage()
     if g_lev > 0 and abs(g_lev - max_leverage) > 0.5:
         print(f"\n  WARNING: GRVT leverage is {g_lev:.0f}x, expected {max_leverage:.0f}x")
-        print(f"  Please set it at: grvt.io -> BTC_USDT_Perp -> adjust leverage")
+        inst = asset_cfg.grvt_instrument if asset_cfg else "BTC_USDT_Perp"
+        print(f"  Please set it at: grvt.io -> {inst} -> adjust leverage")
     elif g_lev > 0:
         print(f"\n  GRVT leverage: {g_lev:.0f}x OK")
 
@@ -266,16 +288,18 @@ async def _monitor_loop(strategy, monitor, alerter):
 # ── Main ───────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="BTC Funding Rate Arbitrage")
+    parser = argparse.ArgumentParser(description="Funding Rate Arbitrage")
+    parser.add_argument("--asset", default="BTC", choices=["BTC", "HYPE", "SOL"],
+                        help="Asset to trade (default: BTC)")
     parser.add_argument("mode", choices=["status", "rates", "entry", "exit", "monitor"])
     args = parser.parse_args()
 
-    hyena, grvt, strategy, monitor, alerter = setup()
+    hyena, grvt, strategy, monitor, alerter, asset_cfg = setup(args.asset)
 
     commands = {
-        "status":  lambda: cmd_status(hyena, grvt, monitor, strategy.config),
-        "rates":   lambda: cmd_rates(hyena, grvt),
-        "entry":   lambda: cmd_entry(strategy, monitor, alerter),
+        "status":  lambda: cmd_status(hyena, grvt, monitor, strategy.config, asset_cfg),
+        "rates":   lambda: cmd_rates(hyena, grvt, asset_cfg),
+        "entry":   lambda: cmd_entry(strategy, monitor, alerter, asset_cfg),
         "exit":    lambda: cmd_exit(strategy, alerter),
         "monitor": lambda: cmd_monitor(strategy, monitor, alerter),
     }
