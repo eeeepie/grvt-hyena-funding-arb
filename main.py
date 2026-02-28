@@ -195,10 +195,11 @@ async def cmd_entry(strategy, monitor, alerter, asset_cfg=None):
     await _monitor_loop(strategy, monitor, alerter)
 
 
-async def cmd_exit(strategy, alerter):
+async def cmd_exit(strategy, alerter, asset_cfg=None):
     alerter.info("Executing exit...")
+    flat_threshold = asset_cfg.flat_threshold if asset_cfg else 0.001
     h_pos, g_pos = strategy.hyena.get_position(), strategy.grvt.get_position()
-    if abs(h_pos.get("size", 0)) < 0.001 and abs(g_pos.get("size", 0)) < 0.001:
+    if abs(h_pos.get("size", 0)) < flat_threshold and abs(g_pos.get("size", 0)) < flat_threshold:
         alerter.info("No positions")
         return
 
@@ -300,7 +301,7 @@ def main():
         "status":  lambda: cmd_status(hyena, grvt, monitor, strategy.config, asset_cfg),
         "rates":   lambda: cmd_rates(hyena, grvt, asset_cfg),
         "entry":   lambda: cmd_entry(strategy, monitor, alerter, asset_cfg),
-        "exit":    lambda: cmd_exit(strategy, alerter),
+        "exit":    lambda: cmd_exit(strategy, alerter, asset_cfg),
         "monitor": lambda: cmd_monitor(strategy, monitor, alerter),
     }
 

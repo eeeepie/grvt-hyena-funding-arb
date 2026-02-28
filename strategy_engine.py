@@ -70,6 +70,8 @@ class StrategyState:
     entry_g_mid: float = 0.0
     entry_h_fills: list = field(default_factory=list)
     entry_g_fills: list = field(default_factory=list)
+    # Entry leverage (user-chosen, used by monitor to detect drift)
+    entry_leverage: float = 0.0
     # Flat detection threshold (set from AssetConfig)
     flat_threshold: float = 0.001
 
@@ -90,6 +92,7 @@ class StrategyState:
         self.entry_time = 0.0
         self.entry_h_balance = self.entry_h_perps_margin = self.entry_g_balance = 0.0
         self.entry_h_mid = self.entry_g_mid = 0.0
+        self.entry_leverage = 0.0
         self.entry_h_fills = []
         self.entry_g_fills = []
         self.clear_entry_state()
@@ -111,6 +114,7 @@ class StrategyState:
             "g_size": self.grvt.size,
             "h_entry_px": self.hyena.entry_px,
             "g_entry_px": self.grvt.entry_px,
+            "entry_leverage": self.entry_leverage,
         }
         os.makedirs(os.path.dirname(sf), exist_ok=True)
         with open(sf, "w") as f:
@@ -133,6 +137,7 @@ class StrategyState:
             self.entry_g_mid = data["entry_g_mid"]
             self.entry_h_fills = data.get("entry_h_fills", [])
             self.entry_g_fills = data.get("entry_g_fills", [])
+            self.entry_leverage = data.get("entry_leverage", 0.0)
             logger.info(f"Entry state loaded from {sf}")
             return True
         except Exception as e:
@@ -308,8 +313,28 @@ class StrategyEngine:
             h_ok = not isinstance(h_res, Exception)
             g_ok = not isinstance(g_res, Exception)
 
-            # Both succeeded → verify and record
+            # Both succeeded → verify actual fills before recording
             if h_ok and g_ok:
+                h_filled = self._check_hyena_filled(h_res)
+                g_filled = self._check_grvt_filled(g_res)
+
+                if not h_filled or not g_filled:
+                    unfilled = []
+                    if not h_filled:
+                        unfilled.append("HyENA")
+                    if not g_filled:
+                        unfilled.append("GRVT")
+                    self.alerter.warning(
+                        f"Order accepted but NOT filled: {', '.join(unfilled)}. "
+                        f"HyENA: {h_res} | GRVT: {g_res}"
+                    )
+                    if attempt < max_entry_retries - 1:
+                        self.alerter.warning("Retrying both legs...")
+                        continue
+                    else:
+                        self.alerter.critical("Max retries reached with unfilled legs")
+                        break
+
                 self.alerter.info(f"HyENA: {h_res}")
                 self.alerter.info(f"GRVT:  {g_res}")
                 await asyncio.sleep(1)
@@ -327,6 +352,7 @@ class StrategyEngine:
                 self.state.entry_h_balance = h_bal.get("account_value", 0) if isinstance(h_bal, dict) else 0
                 self.state.entry_h_perps_margin = h_bal.get("perps_margin", self.state.entry_h_balance) if isinstance(h_bal, dict) else 0
                 self.state.entry_g_balance = g_bal.get("total_equity", 0) if isinstance(g_bal, dict) else 0
+                self.state.entry_leverage = max_lev
 
                 await self._print_entry_costs(entry_ms, h_book["mid"], g_book["mid"])
                 self.state.save_entry_state()
@@ -381,6 +407,22 @@ class StrategyEngine:
                 break
 
         self.state.reset()
+        return False
+
+    @staticmethod
+    def _check_hyena_filled(res) -> bool:
+        """Check if HyENA order response indicates actual fill (not just accepted with zero fill)."""
+        if isinstance(res, Exception):
+            return False
+        if not isinstance(res, dict):
+            return False
+        statuses = res.get("response", {}).get("data", {}).get("statuses", [])
+        for s in statuses:
+            if "error" in s:
+                return False
+            filled = s.get("filled")
+            if filled and float(filled.get("totalSz", "0")) > 0:
+                return True
         return False
 
     @staticmethod
@@ -904,8 +946,20 @@ class StrategyEngine:
         # Re-query live positions to avoid closing already-flat legs
         flat = self.state.flat_threshold
         h_pos, g_pos = await self._both(self.hyena.get_position, self.grvt.get_position)
-        h_sz = h_pos.get("size", 0) if isinstance(h_pos, dict) else self.state.hyena.size
-        g_sz = g_pos.get("size", 0) if isinstance(g_pos, dict) else self.state.grvt.size
+
+        # Check for API errors before trusting position sizes
+        h_err = h_pos.get("error") if isinstance(h_pos, dict) else str(h_pos) if isinstance(h_pos, Exception) else None
+        g_err = g_pos.get("error") if isinstance(g_pos, dict) else str(g_pos) if isinstance(g_pos, Exception) else None
+        if h_err or g_err:
+            self.alerter.warning(
+                f"Position query failed (HyENA: {h_err}, GRVT: {g_err}) — cannot confirm flat, aborting close"
+            )
+            self.state.state = PositionState.ERROR
+            self.state.pending_trade = False
+            return False
+
+        h_sz = h_pos.get("size", 0)
+        g_sz = g_pos.get("size", 0)
 
         if abs(h_sz) < flat and abs(g_sz) < flat:
             self.alerter.info("Both sides already flat, no close needed")
@@ -983,12 +1037,21 @@ class StrategyEngine:
             h_lev = h_pos.get("leverage_value", 0)
             g_lev = g_pos.get("leverage_value", 0)
 
-            max_lev = self.config.max_leverage
-            if h_lev > max_lev:
-                self.alerter.warning(f"HyENA leverage {h_lev:.1f}x > {max_lev:.0f}x! Need to add margin.")
-            if g_lev > max_lev:
-                self.alerter.warning(f"GRVT leverage {g_lev:.1f}x > {max_lev:.0f}x! Need to add margin.")
+            # Use entry leverage as baseline (what user chose), fall back to config default
+            base_lev = self.state.entry_leverage or self.config.max_leverage
+            # Warn only when leverage drifts >20% above entry — signals margin erosion from losses
+            warn_threshold = base_lev * 1.2
+            if h_lev > warn_threshold:
+                self.alerter.warning(
+                    f"HyENA leverage drifted to {h_lev:.1f}x (entry: {base_lev:.0f}x, +{(h_lev/base_lev-1)*100:.0f}%). "
+                    f"Margin eroding — consider adding funds or reducing position."
+                )
+            if g_lev > warn_threshold:
+                self.alerter.warning(
+                    f"GRVT leverage drifted to {g_lev:.1f}x (entry: {base_lev:.0f}x, +{(g_lev/base_lev-1)*100:.0f}%). "
+                    f"Margin eroding — consider adding funds or reducing position."
+                )
             if abs(h_lev - g_lev) > self.config.leverage_diff_trigger:
-                self.alerter.warning(f"Leverage diff: HyENA={h_lev:.1f}x GRVT={g_lev:.1f}x. Consider rebalancing.")
+                self.alerter.warning(f"Leverage imbalance: HyENA={h_lev:.1f}x GRVT={g_lev:.1f}x. Consider rebalancing.")
         except Exception as e:
             self.alerter.warning(f"Rebalance check error: {e}")
