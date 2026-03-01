@@ -7,13 +7,10 @@ __pycache__/
 .idea/
 .claude/
 
-# Project docs (local only, not for repo)
+# AI agent files (local only, not for repo)
 CLAUDE.md
-lessons.md
-CHANGELOG.md
+.ai/
+
+# Strategy docs (local reference only)
 PRD_Cross_Exchange_Funding_Rate_Arbitrage_v3.md
 Research_Checklist_for_New_Strategy.md
-patterns.md
-plans.md
-AGENTS.md
-REVIEWER.md
