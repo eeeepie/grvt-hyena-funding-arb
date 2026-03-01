@@ -1037,21 +1037,8 @@ class StrategyEngine:
             h_lev = h_pos.get("leverage_value", 0)
             g_lev = g_pos.get("leverage_value", 0)
 
-            # Use entry leverage as baseline (what user chose), fall back to config default
-            base_lev = self.state.entry_leverage or self.config.max_leverage
-            # Warn only when leverage drifts >20% above entry — signals margin erosion from losses
-            warn_threshold = base_lev * 1.2
-            if h_lev > warn_threshold:
-                self.alerter.warning(
-                    f"HyENA leverage drifted to {h_lev:.1f}x (entry: {base_lev:.0f}x, +{(h_lev/base_lev-1)*100:.0f}%). "
-                    f"Margin eroding — consider adding funds or reducing position."
-                )
-            if g_lev > warn_threshold:
-                self.alerter.warning(
-                    f"GRVT leverage drifted to {g_lev:.1f}x (entry: {base_lev:.0f}x, +{(g_lev/base_lev-1)*100:.0f}%). "
-                    f"Margin eroding — consider adding funds or reducing position."
-                )
-            if abs(h_lev - g_lev) > self.config.leverage_diff_trigger:
-                self.alerter.warning(f"Leverage imbalance: HyENA={h_lev:.1f}x GRVT={g_lev:.1f}x. Consider rebalancing.")
+            # Leverage monitoring — log only, no warnings.
+            # Exchange-reported leverage != sizing leverage; not actionable in practice.
+            logger.debug(f"Leverage: HyENA={h_lev:.1f}x GRVT={g_lev:.1f}x")
         except Exception as e:
             self.alerter.warning(f"Rebalance check error: {e}")

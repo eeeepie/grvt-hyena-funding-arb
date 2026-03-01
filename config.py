@@ -148,7 +148,7 @@ class StrategyConfig:
 
     # External reward estimates (annualized %)
     usde_reward_apr: float = 12.0   # USDe staking reward
-    grvt_reward_apr: float = 10.0   # GRVT equity reward
+    grvt_reward_apr: float = 11.0   # GRVT equity reward (5% base + 6% referral)
 
     # Rebalancing triggers (PRD Section 8.2)
     max_leverage: float = 3.0
