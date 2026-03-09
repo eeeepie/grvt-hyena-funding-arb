@@ -1,6 +1,24 @@
 
 # Changelog
 
+## 2026-03-09
+
+### WebSocket feed for HyENA position monitoring
+- New `ws_feed.py`: real-time WebSocket client for Hyperliquid `userEvents` channel
+- Subscribes to fill and liquidation events for the active HyENA coin
+- On WS event → immediate mirror-close check (bypasses 10s REST poll interval)
+- Auto-reconnects with exponential backoff (1s base → 30s cap), ping keepalive at 50s
+- REST polling continues unchanged as fallback (WS is additive, not a replacement)
+- Mirror-close detection for HyENA-side events drops from ~10-20s to sub-second
+- No new dependencies (`websockets` 13.1 already installed)
+
+### Files changed
+- `ws_feed.py` — new (~170 lines)
+- `strategy_engine.py` — added `on_ws_position_event()` method for WS-triggered mirror-close
+- `main.py` — WS feed auto-starts in monitor loop when SDK is initialized
+
+---
+
 ## 2026-02-20
 
 ### Entry robustness

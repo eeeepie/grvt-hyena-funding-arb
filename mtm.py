@@ -49,6 +49,8 @@ async def main():
 
     # ── Load entry snapshot from state file ──
     has_snapshot = strategy.state.load_entry_state()
+    # Apply saved direction so PnL uses correct sides
+    strategy.load_direction_from_state()
 
     if has_snapshot:
         entry_h_bal = strategy.state.entry_h_balance
@@ -62,12 +64,36 @@ async def main():
         strategy.state.entry_g_mid = g_entry_px
         print("  (entry_state.json not found, some values are approximate)\n")
 
-    # Infer entry time: state file > 0, else unknown
+    # Direction (from saved state if available, else config default)
+    hyena_is_buy = strategy._hyena_is_buy
+    grvt_is_buy = strategy._grvt_is_buy
+
+    # Infer entry time: state file > 0, else estimate from GRVT fills
     if strategy.state.entry_time > 0:
         entry_time = strategy.state.entry_time
     else:
-        print("  Cannot determine entry time, cannot generate report")
-        return
+        # Try to infer from GRVT entry fills (most recent fill matching entry direction)
+        entry_time = 0
+        try:
+            grvt_is_buy_dir = grvt_is_buy
+            recent_fills = grvt.get_fills(limit=50)
+            entry_fills = [f for f in recent_fills if f.get("is_buyer") == grvt_is_buy_dir]
+            if entry_fills:
+                def _to_secs(t):
+                    t = int(str(t))
+                    if t > 1e15: return t / 1e9
+                    if t > 1e12: return t / 1e3
+                    return float(t)
+                # Earliest matching fill is likely the entry
+                times = [_to_secs(f.get("time", 0)) for f in entry_fills]
+                entry_time = min(times) if times else 0
+        except Exception:
+            pass
+
+        if entry_time == 0:
+            print("  Cannot determine entry time, cannot generate report")
+            return
+        print(f"  (entry time estimated from GRVT fills)\n")
 
     hold_secs = time.time() - entry_time
     holding_days = hold_secs / 86400
@@ -76,10 +102,6 @@ async def main():
     # ── Per-leg PnL from exchange (authoritative) ──
     h_unrealized = h_pos.get("unrealized_pnl", 0)
     g_unrealized = g_pos.get("unrealized_pnl", 0)
-
-    # Direction (needed for funding sign correction)
-    hyena_is_buy = asset_cfg.hyena_is_buy
-    grvt_is_buy = not hyena_is_buy
 
     # ── Funding ──
     h_funding = 0.0

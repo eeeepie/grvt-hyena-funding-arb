@@ -1,3 +1,5 @@
+
+
 # Funding Rate Arbitrage
 
 Delta-neutral funding rate arbitrage across HyENA and GRVT perpetual futures.
@@ -20,6 +22,7 @@ Core alpha = stacking margin rewards (USDe 12% + GRVT equity 10%), not the fundi
 | `config.py` | Settings, `AssetConfig` (BTC_CONFIG, HYPE_CONFIG, SOL_CONFIG), reads `.env` |
 | `exchange_clients.py` | HyENA + GRVT API wrappers + trading |
 | `strategy_engine.py` | Entry / exit / mirror close / rebalance logic |
+| `ws_feed.py` | HyENA WebSocket feed for sub-second mirror-close detection |
 | `monitor.py` | Funding logging, alerts, circuit breaker |
 | `mtm.py` | Mark-to-market PnL report (`--asset BTC\|HYPE\|SOL`) |
 | `btc_funding_compare_v3.py` | Standalone BTC multi-exchange rate comparison (read-only) |
@@ -108,7 +111,7 @@ GRVT_TRADING_ACCOUNT_ID= # GRVT sub-account ID
 
 ### Safety Features
 
-- **Mirror close**: Double-confirmation anomaly detection with automatic emergency close
+- **Mirror close**: Double-confirmation anomaly detection with automatic emergency close. WebSocket feed on HyENA provides sub-second detection (REST polling as fallback)
 - **Entry retry**: Up to 3 attempts with fresh book query and escalating price offset
 - **Exit retry**: Each `market_close` retries 3x internally; outer loop retries 2 more times
 - **State preservation**: Entry snapshot persisted to disk; not wiped on partial failure

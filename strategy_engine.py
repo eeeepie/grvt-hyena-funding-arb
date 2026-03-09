@@ -72,6 +72,8 @@ class StrategyState:
     entry_g_fills: list = field(default_factory=list)
     # Entry leverage (user-chosen, used by monitor to detect drift)
     entry_leverage: float = 0.0
+    # Direction override (None = use AssetConfig default)
+    hyena_is_buy: Optional[bool] = None
     # Flat detection threshold (set from AssetConfig)
     flat_threshold: float = 0.001
 
@@ -115,6 +117,7 @@ class StrategyState:
             "h_entry_px": self.hyena.entry_px,
             "g_entry_px": self.grvt.entry_px,
             "entry_leverage": self.entry_leverage,
+            "hyena_is_buy": self.hyena_is_buy,
         }
         os.makedirs(os.path.dirname(sf), exist_ok=True)
         with open(sf, "w") as f:
@@ -138,6 +141,8 @@ class StrategyState:
             self.entry_h_fills = data.get("entry_h_fills", [])
             self.entry_g_fills = data.get("entry_g_fills", [])
             self.entry_leverage = data.get("entry_leverage", 0.0)
+            if "hyena_is_buy" in data:
+                self.hyena_is_buy = data["hyena_is_buy"]
             logger.info(f"Entry state loaded from {sf}")
             return True
         except Exception as e:
@@ -184,6 +189,18 @@ class StrategyEngine:
         self._hyena_is_buy = self.asset.hyena_is_buy
         self._grvt_is_buy = not self.asset.hyena_is_buy  # opposite side
 
+    def set_direction(self, hyena_is_buy: bool):
+        """Override direction for this trade. Updates internal state + state persistence."""
+        self._hyena_is_buy = hyena_is_buy
+        self._grvt_is_buy = not hyena_is_buy
+        self.state.hyena_is_buy = hyena_is_buy
+
+    def load_direction_from_state(self):
+        """If entry state has a saved direction, apply it."""
+        if self.state.hyena_is_buy is not None:
+            self._hyena_is_buy = self.state.hyena_is_buy
+            self._grvt_is_buy = not self.state.hyena_is_buy
+
     # --- Helpers ---
 
     @staticmethod
@@ -211,7 +228,8 @@ class StrategyEngine:
 
     # ── Entry ──────────────────────────────────────────────────────────────
 
-    async def open_position(self, usd_per_leg: float = None, max_leverage: float = None) -> bool:
+    async def open_position(self, usd_per_leg: float = None, max_leverage: float = None,
+                             hyena_is_buy: bool = None) -> bool:
         if self.state.state != PositionState.FLAT:
             self.alerter.warning(f"Cannot open: current state={self.state.state.value}")
             return False
@@ -219,6 +237,10 @@ class StrategyEngine:
         self.state.state = PositionState.ENTERING
         usd_per_leg = usd_per_leg or self.config.usd_per_leg
         max_lev = max_leverage or self.config.max_leverage
+
+        # Apply direction override if provided
+        if hyena_is_buy is not None:
+            self.set_direction(hyena_is_buy)
 
         # 1. Pre-flight
         self.alerter.info("Pre-entry checks...")
@@ -760,8 +782,26 @@ class StrategyEngine:
 
     # ── Mirror Close ───────────────────────────────────────────────────────
 
+    async def on_ws_position_event(self, coin: str, fill_data: dict):
+        """Called by WS feed on fill/liquidation — triggers immediate mirror-close check.
+        Skips the 10s poll wait; goes straight to REST verification."""
+        if self.state.state != PositionState.OPEN or self.state.mirror_close_active or self.state.pending_trade:
+            return
+        is_liq = fill_data.get("liquidation", False)
+        if is_liq:
+            self.alerter.emergency(f"WS: liquidation detected on {coin}! Immediate mirror-close check.")
+        else:
+            self.alerter.warning(
+                f"WS: unexpected fill on {coin} "
+                f"({fill_data.get('side', '?')} {fill_data.get('sz', '?')} @ ${fill_data.get('px', '?')}). "
+                f"Triggering immediate mirror-close check."
+            )
+        # Go straight to REST-verified check (bypasses the 10s poll interval)
+        await self.check_mirror_close()
+
     async def check_mirror_close(self):
-        """Called every 10s. Detects unexpected position changes → two-leg emergency close.
+        """Called every 10s (REST poll) or immediately (WS event).
+        Detects unexpected position changes → two-leg emergency close.
 
         Three modes:
         1. ERROR retry — mirror_close_active + ERROR state → backoff retry _emergency_close_all

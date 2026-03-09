@@ -19,6 +19,7 @@ from config import load_config, AssetConfig
 from exchange_clients import HyenaClient, GrvtClient, ANNUAL_MULTIPLIER
 from strategy_engine import StrategyEngine
 from monitor import Monitor, Alerter
+from ws_feed import HyenaWsFeed
 
 
 def setup(asset_name: str = "BTC"):
@@ -101,23 +102,7 @@ async def cmd_rates(hyena, grvt, asset_cfg=None):
     h = hyena.get_funding_rate()
     g = grvt.get_funding_rate()
 
-    hyena_is_buy = asset_cfg.hyena_is_buy if asset_cfg else True
-    h_dir = "Long" if hyena_is_buy else "Short"
-    g_dir = "Short" if hyena_is_buy else "Long"
     grvt_fh = g.get("funding_interval_hours", 8)
-
-    # Spread for strategy: direction-dependent
-    # positive rate = longs pay shorts
-    # If HyENA is buy (long): income = -h_rate + g_rate
-    # If HyENA is sell (short): income = +h_rate - g_rate
-    if hyena_is_buy:
-        spread_settled = g["funding_8h_decimal"] - h["funding_8h"]
-        spread_pred = g["funding_8h_decimal"] - h.get("predicted_8h", h["funding_8h"])
-    else:
-        spread_settled = h["funding_8h"] - g["funding_8h_decimal"]
-        spread_pred = h.get("predicted_8h", h["funding_8h"]) - g["funding_8h_decimal"]
-    spread_settled_ann = spread_settled * ANNUAL_MULTIPLIER
-    spread_pred_ann = spread_pred * ANNUAL_MULTIPLIER
 
     ts = h.get("timestamp")
     ts_str = f" (settle: {ts.strftime('%H:%M UTC')})" if ts else ""
@@ -125,34 +110,38 @@ async def cmd_rates(hyena, grvt, asset_cfg=None):
     print(f"  HyENA Settled:   {h['funding_8h']:+.6f}/8h  {h['annual_pct']:+.2f}% ann{ts_str}")
     print(f"  HyENA Predicted: {h.get('predicted_8h',0):+.6f}/8h  {h.get('predicted_ann',0):+.2f}% ann")
     print(f"  GRVT ({grvt_fh}h→8h): {g['funding_8h_decimal']:+.6f}/8h  {g['annual_pct']:+.2f}% ann")
-    print(f"  Net Spread ({h_dir} H + {g_dir} G):")
-    print(f"    settled: {spread_settled:+.6f}/8h  {spread_settled_ann:+.2f}% ann")
-    print(f"    predict: {spread_pred:+.6f}/8h  {spread_pred_ann:+.2f}% ann")
 
-    # Yield estimate — predicted rate is more indicative
+    # Show spread for both directions
+    h_pred = h.get("predicted_8h", h["funding_8h"])
     h_pred_ann = h.get("predicted_ann", h["annual_pct"])
-    if hyena_is_buy:
-        h_funding = -h_pred_ann     # long pays when rate positive
-        g_funding = g["annual_pct"]  # short receives when rate positive
-    else:
-        h_funding = h_pred_ann      # short receives when rate positive
-        g_funding = -g["annual_pct"] # long pays when rate positive
     usde, equity = 12.0, 10.0
-    net = h_funding + g_funding + usde + equity
 
-    print(f"\n  Yield Estimate (based on predicted rate):")
-    print(f"    HyENA {h_dir} Funding: {h_funding:+.1f}% (predicted)")
-    print(f"    GRVT {g_dir} Funding: {g_funding:+.1f}%")
-    print(f"    USDe Reward:        +{usde:.0f}% (off-chain reward, not in API rate)")
-    print(f"    GRVT Equity:        +{equity:.0f}% (off-chain reward)")
+    for label, hib in [("[A] Long H + Short G", True), ("[B] Short H + Long G", False)]:
+        if hib:
+            spread_s = g["funding_8h_decimal"] - h["funding_8h"]
+            spread_p = g["funding_8h_decimal"] - h_pred
+            h_fund = -h_pred_ann
+            g_fund = g["annual_pct"]
+        else:
+            spread_s = h["funding_8h"] - g["funding_8h_decimal"]
+            spread_p = h_pred - g["funding_8h_decimal"]
+            h_fund = h_pred_ann
+            g_fund = -g["annual_pct"]
+        net = h_fund + g_fund + usde + equity
+        default = " (default)" if hib == (asset_cfg.hyena_is_buy if asset_cfg else True) else ""
+        print(f"\n  {label}{default}:")
+        print(f"    settled: {spread_s:+.6f}/8h  {spread_s * ANNUAL_MULTIPLIER:+.2f}% ann")
+        print(f"    predict: {spread_p:+.6f}/8h  {spread_p * ANNUAL_MULTIPLIER:+.2f}% ann")
+        print(f"    yield est: funding {h_fund + g_fund:+.1f}% + rewards {usde + equity:+.0f}% = {net:+.1f}% ann")
     if asset_cfg and asset_cfg.name != "BTC":
-        print(f"    GRVT 5x Points:     (altcoin multiplier)")
-    print(f"    ─────────────────────")
-    print(f"    Est. Net Yield:      {net:+.1f}% ann")
+        print(f"\n  Note: GRVT 5x points multiplier (altcoin)")
 
 
 async def cmd_entry(strategy, monitor, alerter, asset_cfg=None):
     min_notional = asset_cfg.grvt_min_notional if asset_cfg else 100.0
+    hyena = strategy.hyena
+    grvt = strategy.grvt
+
     # Interactive input for position parameters
     print("── Entry Parameters ──\n")
     try:
@@ -172,6 +161,48 @@ async def cmd_entry(strategy, monitor, alerter, asset_cfg=None):
         alerter.critical(f"Leverage {max_leverage}x out of valid range [1, 10]")
         return
 
+    # Direction picker: show current rates and let user choose
+    default_hib = asset_cfg.hyena_is_buy if asset_cfg else True
+    try:
+        h = hyena.get_funding_rate()
+        g = grvt.get_funding_rate()
+        h_pred = h.get("predicted_8h", h["funding_8h"])
+
+        print(f"\n  Current rates:")
+        print(f"    HyENA: {h.get('predicted_8h', h['funding_8h']):+.6f}/8h ({h.get('predicted_ann', h['annual_pct']):+.1f}% ann)")
+        print(f"    GRVT:  {g['funding_8h_decimal']:+.6f}/8h ({g['annual_pct']:+.1f}% ann)")
+
+        # Compute spread for both directions
+        spread_a = g["funding_8h_decimal"] - h_pred  # Long H + Short G
+        spread_b = h_pred - g["funding_8h_decimal"]  # Short H + Long G
+        spread_a_ann = spread_a * ANNUAL_MULTIPLIER
+        spread_b_ann = spread_b * ANNUAL_MULTIPLIER
+
+        a_default = " (default)" if default_hib else ""
+        b_default = " (default)" if not default_hib else ""
+        print(f"\n  Direction:")
+        print(f"    [A] Long HyENA + Short GRVT{a_default} — spread: {spread_a_ann:+.1f}% ann")
+        print(f"    [B] Short HyENA + Long GRVT{b_default} — spread: {spread_b_ann:+.1f}% ann")
+
+        default_letter = "A" if default_hib else "B"
+        dir_input = input(f"  Choose [{default_letter}]: ").strip().upper()
+        if dir_input == "":
+            hyena_is_buy = default_hib
+        elif dir_input == "A":
+            hyena_is_buy = True
+        elif dir_input == "B":
+            hyena_is_buy = False
+        else:
+            alerter.critical(f"Invalid direction '{dir_input}', aborting")
+            return
+    except Exception as e:
+        alerter.warning(f"Could not fetch rates for direction picker: {e}")
+        alerter.info(f"Using default direction")
+        hyena_is_buy = default_hib
+
+    h_dir = "Long" if hyena_is_buy else "Short"
+    g_dir = "Short" if hyena_is_buy else "Long"
+
     # Check GRVT leverage (API set is deprecated, must use frontend)
     g_lev = strategy.grvt.get_leverage()
     if g_lev > 0 and abs(g_lev - max_leverage) > 0.5:
@@ -181,14 +212,15 @@ async def cmd_entry(strategy, monitor, alerter, asset_cfg=None):
     elif g_lev > 0:
         print(f"\n  GRVT leverage: {g_lev:.0f}x OK")
 
-    print(f"\n  -> ${usd_per_leg:,.0f} per leg | max leverage {max_leverage}x")
+    print(f"\n  -> ${usd_per_leg:,.0f} per leg | {max_leverage}x | {h_dir} HyENA + {g_dir} GRVT")
     confirm = input("  Confirm entry? [y/N]: ").strip().lower()
     if confirm not in ("y", "yes"):
         print("  Cancelled")
         return
 
     alerter.info("Executing entry...")
-    if not await strategy.open_position(usd_per_leg=usd_per_leg, max_leverage=max_leverage):
+    if not await strategy.open_position(usd_per_leg=usd_per_leg, max_leverage=max_leverage,
+                                         hyena_is_buy=hyena_is_buy):
         alerter.critical("Entry failed!")
         return
     alerter.info("Entry successful -> starting monitor")
@@ -214,6 +246,8 @@ async def cmd_exit(strategy, alerter, asset_cfg=None):
     # Try loading persisted entry state (cross-process)
     if strategy.state.entry_time == 0:
         strategy.state.load_entry_state()
+    # Apply saved direction so PnL report uses correct sides
+    strategy.load_direction_from_state()
 
     # Save snapshot before close resets state
     has_entry_data = strategy.state.entry_time > 0
@@ -254,6 +288,9 @@ async def cmd_exit(strategy, alerter, asset_cfg=None):
 async def cmd_monitor(strategy, monitor, alerter):
     h_pos, g_pos = strategy.hyena.get_position(), strategy.grvt.get_position()
     strategy.state.load_from_exchange(h_pos, g_pos)
+    # Load persisted entry state (includes direction)
+    strategy.state.load_entry_state()
+    strategy.load_direction_from_state()
 
     if strategy.state.state.value == "open":
         alerter.info(f"Loaded positions: HyENA={strategy.state.hyena.size:+.4f} GRVT={strategy.state.grvt.size:+.4f}")
@@ -274,16 +311,41 @@ async def _monitor_loop(strategy, monitor, alerter):
             await fn()
             await asyncio.sleep(interval)
 
+    tasks = [
+        loop(strategy.check_mirror_close, mc.position_poll_interval),
+        monitor.collect_funding_rates(),
+        monitor.monitor_usde_peg(),
+        monitor.check_circuit_breaker(),
+        loop(strategy.check_rebalance, 300),
+    ]
+
+    # Start WebSocket feed for sub-second mirror-close detection (HyENA leg)
+    wallet = getattr(strategy.hyena, '_account', None)
+    if wallet:
+        ws_feed = _create_ws_feed(strategy, alerter, wallet.address)
+        tasks.append(ws_feed.run())
+        alerter.info(f"WS feed enabled for {strategy.asset.hyena_coin} (sub-second mirror-close)")
+    else:
+        alerter.warning("WS feed disabled: HyENA SDK not initialized (no wallet address)")
+
     try:
-        await asyncio.gather(
-            loop(strategy.check_mirror_close, mc.position_poll_interval),
-            monitor.collect_funding_rates(),
-            monitor.monitor_usde_peg(),
-            monitor.check_circuit_breaker(),
-            loop(strategy.check_rebalance, 300),
-        )
+        await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         alerter.info("Monitor stopped")
+
+
+def _create_ws_feed(strategy, alerter, wallet_address: str) -> HyenaWsFeed:
+    """Create WS feed with callbacks wired to strategy engine."""
+
+    def on_position_change(coin: str, fill_data: dict):
+        """WS callback — schedule async mirror-close check on the event loop."""
+        asyncio.ensure_future(strategy.on_ws_position_event(coin, fill_data))
+
+    return HyenaWsFeed(
+        wallet_address=wallet_address,
+        coin=strategy.asset.hyena_coin,
+        on_position_change=on_position_change,
+    )
 
 
 # ── Main ───────────────────────────────────────────────────────────────
