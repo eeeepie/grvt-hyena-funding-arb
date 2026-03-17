@@ -202,7 +202,8 @@ class HyenaClient:
         if not self._account:
             return {"balance": 0.0, "error": "SDK not initialized"}
         try:
-            margin = self._get_clearinghouse().get("marginSummary", {})
+            state = self._get_clearinghouse()
+            margin = state.get("marginSummary", {})
             perps_value = safe_float(margin.get("accountValue"))
             spot_usde = self._get_spot_balance()
             return {
@@ -214,6 +215,26 @@ class HyenaClient:
             }
         except Exception as e:
             return {"balance": 0.0, "error": str(e)}
+
+    def get_margin_ratio(self) -> dict:
+        """Get maintenance margin ratio (MMR). Liquidation at MMR >= 100%.
+        Uses pre-computed crossMaintenanceMarginUsed from clearinghouseState."""
+        if not self._account:
+            return {"mmr_pct": 0.0, "error": "SDK not initialized"}
+        try:
+            state = self._get_clearinghouse()
+            margin = state.get("marginSummary", {})
+            equity = safe_float(margin.get("accountValue"))
+            maint_margin = safe_float(state.get("crossMaintenanceMarginUsed"))
+            mmr_pct = (maint_margin / equity * 100) if equity > 0 else 0.0
+            return {
+                "equity": equity,
+                "maintenance_margin": maint_margin,
+                "mmr_pct": mmr_pct,
+            }
+        except Exception as e:
+            logger.error(f"HyENA get_margin_ratio failed: {e}")
+            return {"mmr_pct": 0.0, "error": str(e)}
 
     # --- Trading ---
 
@@ -547,6 +568,25 @@ class GrvtClient:
             }
         except Exception as e:
             return {"balance": 0.0, "error": str(e)}
+
+    def get_margin_ratio(self) -> dict:
+        """Get maintenance margin ratio (MMR). Liquidation at MMR >= 100%.
+        Uses maintenance_margin from account_summary."""
+        if not self._authenticated:
+            return {"mmr_pct": 0.0, "error": "Not authenticated"}
+        try:
+            data = self._trade_post("/full/v1/account_summary", {}).get("result", {})
+            equity = safe_float(data.get("total_equity"))
+            maint_margin = safe_float(data.get("maintenance_margin"))
+            mmr_pct = (maint_margin / equity * 100) if equity > 0 else 0.0
+            return {
+                "equity": equity,
+                "maintenance_margin": maint_margin,
+                "mmr_pct": mmr_pct,
+            }
+        except Exception as e:
+            logger.error(f"GRVT get_margin_ratio failed: {e}")
+            return {"mmr_pct": 0.0, "error": str(e)}
 
     # --- Leverage ---
 

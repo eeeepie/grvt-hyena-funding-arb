@@ -1,6 +1,19 @@
 
 # Changelog
 
+## 2026-03-17
+
+### Margin ratio (MMR) monitoring
+- New `get_margin_ratio()` on both `HyenaClient` and `GrvtClient`
+- HyENA: uses pre-computed `crossMaintenanceMarginUsed` from `clearinghouseState`
+- GRVT: uses `maintenance_margin` from `account_summary`
+- MMR = maintenance_margin / equity × 100. Liquidation at 100%.
+- Monitor loop checks MMR every 10s (same as position poll)
+- Warning at 50%, emergency alert at 70% (configurable in `MonitorConfig`)
+- `print_status` now shows per-leg MMR when positions are open
+
+---
+
 ## 2026-03-09
 
 ### WebSocket feed for HyENA position monitoring

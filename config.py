@@ -173,6 +173,10 @@ class MonitorConfig:
     funding_negative_duration_hours: int = 6
     api_failure_threshold: int = 3  # consecutive failures
 
+    # Margin ratio (MMR) thresholds
+    mmr_warning_pct: float = 50.0    # MMR > 50% → warning
+    mmr_emergency_pct: float = 70.0  # MMR > 70% → emergency (close positions)
+
     # Mirror close (PRD Section 9)
     mirror_close_max_slippage: float = 0.005  # 0.5%
     mirror_close_timeout_seconds: int = 30

@@ -316,6 +316,7 @@ async def _monitor_loop(strategy, monitor, alerter):
         monitor.collect_funding_rates(),
         monitor.monitor_usde_peg(),
         monitor.check_circuit_breaker(),
+        monitor.monitor_margin_ratio(),
         loop(strategy.check_rebalance, 300),
     ]
 

@@ -111,6 +111,7 @@ GRVT_TRADING_ACCOUNT_ID= # GRVT sub-account ID
 
 ### Safety Features
 
+- **Margin ratio (MMR) monitoring**: Per-leg maintenance margin ratio checked every 10s. Warning at 50%, emergency at 70%. Prevents liquidation on either exchange independently.
 - **Mirror close**: Double-confirmation anomaly detection with automatic emergency close. WebSocket feed on HyENA provides sub-second detection (REST polling as fallback)
 - **Entry retry**: Up to 3 attempts with fresh book query and escalating price offset
 - **Exit retry**: Each `market_close` retries 3x internally; outer loop retries 2 more times

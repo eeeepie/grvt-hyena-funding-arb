@@ -152,6 +152,45 @@ class Monitor:
         elif dev > self.config.usde_depeg_warning:
             self.alerter.critical(f"USDe depeg warning: ${price:.4f} (deviation {dev*100:.2f}% > 0.5%)")
 
+    # --- Margin Ratio (MMR) ---
+
+    async def monitor_margin_ratio(self):
+        await self._run_loop("MMR monitor", self.config.position_poll_interval,
+                             self._check_mmr_once)
+
+    async def _check_mmr_once(self):
+        h_mmr = self.hyena.get_margin_ratio()
+        g_mmr = self.grvt.get_margin_ratio()
+
+        h_pct = h_mmr.get("mmr_pct", 0)
+        g_pct = g_mmr.get("mmr_pct", 0)
+
+        # Skip if no positions (both MMR = 0)
+        if h_pct == 0 and g_pct == 0:
+            return
+
+        worst = max(h_pct, g_pct)
+        worst_leg = "HyENA" if h_pct >= g_pct else "GRVT"
+
+        if worst >= self.config.mmr_emergency_pct:
+            self.alerter.emergency(
+                f"MMR CRITICAL! {worst_leg} at {worst:.1f}% "
+                f"(HyENA: {h_pct:.1f}%, GRVT: {g_pct:.1f}%). "
+                f"Liquidation imminent — close positions NOW!"
+            )
+        elif worst >= self.config.mmr_warning_pct:
+            self.alerter.critical(
+                f"MMR WARNING: {worst_leg} at {worst:.1f}% "
+                f"(HyENA: {h_pct:.1f}%, GRVT: {g_pct:.1f}%)"
+            )
+        else:
+            self.alerter.info(
+                f"MMR | HyENA: {h_pct:.1f}% (${h_mmr.get('maintenance_margin',0):,.2f} / "
+                f"${h_mmr.get('equity',0):,.2f}) | "
+                f"GRVT: {g_pct:.1f}% (${g_mmr.get('maintenance_margin',0):,.2f} / "
+                f"${g_mmr.get('equity',0):,.2f})"
+            )
+
     # --- Circuit Breaker ---
 
     async def check_circuit_breaker(self):
@@ -223,6 +262,22 @@ class Monitor:
                 f"    Spread(predict): {spread_pred * ANNUAL_MULTIPLIER:+.1f}% ann",
                 f"    Note: USDe 12% + GRVT 10% rewards are NOT included in the rates above",
             ]
+        except Exception:
+            pass
+
+        # MMR
+        try:
+            h_mmr = self.hyena.get_margin_ratio()
+            g_mmr = self.grvt.get_margin_ratio()
+            h_pct = h_mmr.get("mmr_pct", 0)
+            g_pct = g_mmr.get("mmr_pct", 0)
+            if h_pct > 0 or g_pct > 0:
+                lines += [
+                    f"\n  Margin Ratio (MMR):",
+                    f"    HyENA: {h_pct:.1f}% (maint ${h_mmr.get('maintenance_margin',0):,.2f} / equity ${h_mmr.get('equity',0):,.2f})",
+                    f"    GRVT:  {g_pct:.1f}% (maint ${g_mmr.get('maintenance_margin',0):,.2f} / equity ${g_mmr.get('equity',0):,.2f})",
+                    f"    Warning: {self.config.mmr_warning_pct:.0f}% | Emergency: {self.config.mmr_emergency_pct:.0f}%",
+                ]
         except Exception:
             pass
 
